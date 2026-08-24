@@ -36,7 +36,14 @@ var _ adapter.InterfaceUpdateListener = (*OutboundMonitoring)(nil)
 const (
 	defaultWorkerCount    = 10
 	defaultDebounceWindow = 500 * time.Millisecond
-	defaultURLTestTimeout = 5 * time.Second
+	// 5 s is enough for a direct hop and far too short for anything that has to
+	// build a path first: an I2P lane needs to construct a multi-hop circuit,
+	// and a QUIC transport often loses its first handshake datagram. Both then
+	// get reported dead — a red cross in the UI and exclusion from the auto
+	// group — despite carrying traffic perfectly well. Those are exactly the
+	// lanes that survive when the direct ones are blocked, so mislabelling them
+	// is the worst possible failure. A dead node still fails, just later.
+	defaultURLTestTimeout = 45 * time.Second
 	defaultIdleTimeout    = 10 * time.Minute
 	defaultInterval       = 5 * time.Minute
 	defaultURLTest        = "https://www.gstatic.com/generate_204"

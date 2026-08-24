@@ -387,7 +387,10 @@ func (g *URLTestGroup) urlTest(ctx context.Context, force bool) (map[string]uint
 			continue
 		}
 		b.Go(realTag, func() (any, error) {
-			testCtx, cancel := context.WithTimeout(g.ctx, C.TCPTimeout)
+			// Match the monitoring default: a lane that builds a circuit (I2P)
+			// or loses its first QUIC datagram needs longer than TCPTimeout,
+			// and cutting it short reports a working node as dead.
+			testCtx, cancel := context.WithTimeout(g.ctx, 45*time.Second)
 			defer cancel()
 			t, err := urltest.URLTest(testCtx, g.link, p)
 			if err != nil {
