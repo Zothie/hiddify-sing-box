@@ -76,6 +76,10 @@ type OutboundMonitoring struct {
 	workersCount     int
 	history          adapter.URLTestHistoryStorage
 
+	// throughput is nil unless bulk probing was configured. When nil the
+	// monitor behaves exactly as before.
+	throughput *throughputProbe
+
 	mainTicker *time.Ticker
 
 	priorityQueue chan *testTask
@@ -241,7 +245,8 @@ func NewOutboundMonitoring(ctx context.Context, logger log.ContextLogger, option
 		outboundManager: service.FromContext[adapter.OutboundManager](ctx),
 		endpointManager: service.FromContext[adapter.EndpointManager](ctx),
 
-		history: history,
+		history:    history,
+		throughput: newThroughputProbe(options.Throughput),
 
 		mainInterval:   options.Interval.Build(),
 		idleTimeout:    options.IdleTimeout.Build(),
@@ -545,7 +550,7 @@ func (m *OutboundMonitoring) executeTask(task *testTask) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		delay, err := m.tester(m.ctx, task.outboundTag)
+		delay, err := m.tester(m.ctx, task.outboundTag, task.cycleID)
 
 		outcome := testOutcome{
 			outboundTag: task.outboundTag,
@@ -573,7 +578,7 @@ func (m *OutboundMonitoring) executeTask(task *testTask) {
 
 }
 
-func (m *OutboundMonitoring) tester(parent context.Context, tag string) (adapter.URLTestHistory, error) {
+func (m *OutboundMonitoring) tester(parent context.Context, tag string, cycleID uint64) (adapter.URLTestHistory, error) {
 	out, ok := m.outbounds[tag]
 	if !ok {
 		return adapter.URLTestHistory{Delay: 0}, errors.New("outbound not registered")
@@ -590,8 +595,26 @@ func (m *OutboundMonitoring) tester(parent context.Context, tag string) (adapter
 		Time:  time.Now(),
 		Delay: delay,
 	}
+	// Carry forward any existing throughput verdict. It is measured on a much
+	// slower cadence than latency, so it must survive cycles that do not
+	// re-measure it, otherwise every latency probe would erase the evidence.
+	out.mu.Lock()
+	his.CarriedBytes = out.history.CarriedBytes
+	his.ThroughputKBps = out.history.ThroughputKBps
+	his.ThroughputTime = out.history.ThroughputTime
+	out.mu.Unlock()
+
 	if err != nil || delay >= TimeoutDelay {
 		his.Delay = TimeoutDelay
+		// The node failed even the cheap probe, so it certainly carries no
+		// data. Record that as a throughput verdict too, so the two-stage
+		// filter sees it without waiting for the slow bulk cycle.
+		if m.throughput != nil {
+			his.CarriedBytes = 0
+			his.ThroughputKBps = 0
+			his.ThroughputTime = time.Now()
+			m.throughput.noteResult(tag, false, time.Now())
+		}
 		m.logger.Warn("outbound ", tag, " URL test failed: ", err)
 		return his, err
 	}
@@ -618,7 +641,49 @@ func (m *OutboundMonitoring) tester(parent context.Context, tag string) (adapter
 	} else {
 		m.logger.Info("outbound ", tag, " , IP: -          (", his.Delay, "ms)")
 	}
+
+	m.maybeProbeThroughput(parent, tag, out, &his, cycleID)
+
 	return his, nil
+}
+
+// maybeProbeThroughput runs the bulk probe if it is configured, due this cycle,
+// and not suppressed by backoff. It updates his in place.
+//
+// The latency probe above has already passed at this point, which is exactly
+// the situation the bulk probe exists for: a node frozen by a censor answers
+// the latency probe perfectly and only fails once enough bytes are demanded.
+func (m *OutboundMonitoring) maybeProbeThroughput(parent context.Context, tag string, out *outboundState, his *adapter.URLTestHistory, cycleID uint64) {
+	if m.throughput == nil || !m.throughput.dueForCycle(cycleID) {
+		return
+	}
+	now := time.Now()
+	if m.throughput.suppressed(tag, now) {
+		return
+	}
+	select {
+	case <-parent.Done():
+		return
+	default:
+	}
+
+	result, passed, err := m.throughput.run(parent, out.outbound)
+	if parent.Err() != nil {
+		return
+	}
+
+	m.throughput.noteResult(tag, passed, time.Now())
+
+	his.CarriedBytes = result.CarriedBytes
+	his.ThroughputKBps = result.KBps
+	his.ThroughputTime = time.Now()
+
+	if passed {
+		m.logger.Info("outbound ", tag, " carried ", result.CarriedBytes, " bytes at ", result.KBps, " KB/s")
+	} else {
+		m.logger.Warn("outbound ", tag, " FAILED throughput probe: carried only ",
+			result.CarriedBytes, " bytes (latency probe said ", his.Delay, "ms): ", err)
+	}
 }
 
 func (m *OutboundMonitoring) startCycleOnce() bool {
@@ -767,6 +832,16 @@ func (m *OutboundMonitoring) applyResult(outcome testOutcome) *adapter.URLTestHi
 	state.history.Delay = outcome.history.Delay
 	state.history.Time = outcome.history.Time
 	state.from_cache = false
+	// Throughput evidence is only meaningful when it was actually measured;
+	// an unmeasured outcome must not wipe a previous verdict.
+	if outcome.history.ThroughputMeasured() {
+		if outcome.history.CarriedBytes != state.history.CarriedBytes {
+			m.cacheDirty.Store(true)
+		}
+		state.history.CarriedBytes = outcome.history.CarriedBytes
+		state.history.ThroughputKBps = outcome.history.ThroughputKBps
+		state.history.ThroughputTime = outcome.history.ThroughputTime
+	}
 	if outcome.history.IpInfo != nil {
 		state.history.IpInfo = outcome.history.IpInfo
 	}

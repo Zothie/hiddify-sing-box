@@ -25,6 +25,32 @@ type URLTestHistory struct {
 	Delay       uint16         `json:"delay"`
 	IpInfo      *ipinfo.IpInfo `json:"ipinfo"`
 	IsFromCache bool           `json:"from_cache"`
+
+	// Throughput evidence, populated only by the bulk (sized-GET) probe.
+	//
+	// Delay alone cannot distinguish a healthy node from one a censor has
+	// frozen: state censors (TSPU in particular) let the TCP handshake and TLS
+	// complete normally and only stop forwarding after roughly 16-20 KB. A HEAD
+	// request to a /generate_204 endpoint transfers no body at all, so it
+	// returns instantly over a path that in reality carries nothing. These
+	// fields record what a transfer large enough to cross that threshold
+	// actually achieved.
+	//
+	// CarriedBytes is how many body bytes were really read. Zero means either
+	// "never probed" or "probed and carried nothing" -- consumers must tell
+	// those apart via ThroughputMeasured, or a fresh start would look like a
+	// total outage.
+	CarriedBytes int64 `json:"carried_bytes,omitempty"`
+	// ThroughputKBps is CarriedBytes over the elapsed transfer time, in KB/s.
+	ThroughputKBps uint32 `json:"throughput_kbps,omitempty"`
+	// ThroughputTime is when the bulk probe last completed; zero means never.
+	ThroughputTime time.Time `json:"throughput_time,omitempty"`
+}
+
+// ThroughputMeasured reports whether a bulk probe has ever produced a verdict
+// for this outbound. An unmeasured node must not be treated as proven-dead.
+func (h *URLTestHistory) ThroughputMeasured() bool {
+	return h != nil && !h.ThroughputTime.IsZero()
 }
 
 type URLTestHistoryStorage interface {

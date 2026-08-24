@@ -33,6 +33,9 @@ const (
 	// Order is preference, delay is only a liveness signal. See priority.go
 	// for why "fastest" is the wrong question when a censor throttles a node.
 	StrategyPriority = "priority"
+	// Two-stage: discard outbounds that cannot demonstrably carry bytes, then
+	// rank the survivors by measured goodput. See throughput.go.
+	StrategyThroughput = "throughput"
 )
 
 type Balancer struct {
@@ -105,6 +108,8 @@ func (s *Balancer) Start() error {
 		s.strategyFn = NewLowestDelay(outbounds, s.options)
 	case StrategyPriority:
 		s.strategyFn = NewPriority(outbounds, s.options)
+	case StrategyThroughput:
+		s.strategyFn = NewThroughput(outbounds, s.options)
 	default:
 		return E.New("unknown load balance strategy: ", s.options.Strategy)
 	}
