@@ -37,12 +37,18 @@ type Priority struct {
 
 func NewPriority(outbounds []adapter.Outbound, options option.BalancerOutboundOptions) *Priority {
 	couts := convertOutbounds(outbounds)
+	// Guard the empty case: a group with no members for a network would panic
+	// on index [0] at Start. Inherited from lowest_delay.go, but Throughput
+	// already guards it — keep the two consistent.
+	sel := map[string]adapter.Outbound{}
+	for _, net := range []string{N.NetworkTCP, N.NetworkUDP} {
+		if len(couts[net]) > 0 {
+			sel[net] = couts[net][0]
+		}
+	}
 	return &Priority{
-		outbounds: couts,
-		selectedOutbound: map[string]adapter.Outbound{
-			N.NetworkUDP: couts[N.NetworkUDP][0],
-			N.NetworkTCP: couts[N.NetworkTCP][0],
-		},
+		outbounds:        couts,
+		selectedOutbound: sel,
 	}
 }
 
@@ -52,7 +58,11 @@ func (s *Priority) Now() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	return s.selectedOutbound[N.NetworkTCP].Tag()
+	// An empty group has no selection; report that rather than dereferencing nil.
+	if out, ok := s.selectedOutbound[N.NetworkTCP]; ok && out != nil {
+		return out.Tag()
+	}
+	return ""
 }
 
 // firstAlive returns the earliest-listed outbound whose last probe did not time
