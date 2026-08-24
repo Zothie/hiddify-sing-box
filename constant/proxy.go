@@ -28,7 +28,12 @@ const (
 	TypeVLESS              = "vless"
 	TypeTUIC               = "tuic"
 	TypeHysteria2          = "hysteria2"
-	TypeHysteriaRealm      = "hysteria-realm"
+	// TypeJuicity is a fork-local QUIC protocol, not present in upstream sing-box
+	// (upstream issue #788 was never merged). Added here for transport diversity:
+	// DPI that learns to fingerprint TUIC/Hysteria2 does not automatically kill
+	// juicity, so the tunnel survives a single-protocol block.
+	TypeJuicity       = "juicity" //H
+	TypeHysteriaRealm = "hysteria-realm"
 	TypePsiphon            = "psiphon"
 	TypeTunnelClient       = "tunnel_client"
 	TypeTunnelServer       = "tunnel_server"
@@ -106,6 +111,8 @@ func ProxyDisplayName(proxyType string) string {
 		return "TUIC"
 	case TypeHysteria2:
 		return "Hysteria2"
+	case TypeJuicity:
+		return "Juicity"
 	case TypeMieru:
 		return "Mieru"
 	case TypeAnyTLS:

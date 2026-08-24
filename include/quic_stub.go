@@ -60,6 +60,11 @@ func registerQUICOutbounds(registry *outbound.Registry) {
 	outbound.Register[option.Hysteria2OutboundOptions](registry, C.TypeHysteria2, func(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.Hysteria2OutboundOptions) (adapter.Outbound, error) {
 		return nil, C.ErrQUICNotIncluded
 	})
+	// juicity is QUIC-only, so without with_quic it must report the same
+	// "not included" error rather than "unknown outbound type".
+	outbound.Register[option.JuicityOutboundOptions](registry, C.TypeJuicity, func(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.JuicityOutboundOptions) (adapter.Outbound, error) {
+		return nil, C.ErrQUICNotIncluded
+	})
 }
 
 func registerQUICTransports(registry *dns.TransportRegistry) {

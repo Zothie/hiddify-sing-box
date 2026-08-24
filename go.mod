@@ -13,6 +13,7 @@ require (
 	github.com/caddyserver/zerossl v0.1.5
 	github.com/coder/websocket v1.8.14
 	github.com/cretz/bine v0.2.0
+	github.com/daeuniverse/outbound v0.0.0-20250219135309-c607702d1c85
 	github.com/database64128/tfo-go/v2 v2.3.2
 	github.com/enfein/mieru/v3 v3.27.0
 	github.com/go-chi/chi/v5 v5.2.5
@@ -80,8 +81,18 @@ require (
 )
 
 require (
+	github.com/awnumar/fastrand v0.0.0-20210315215012-30ee0990fa2d // indirect
+	github.com/awnumar/memcall v0.0.0-20190816154910-db5ea08008a3 // indirect
+	github.com/awnumar/memguard v0.19.1 // indirect
+	github.com/daeuniverse/quic-go v0.0.0-20250210145620-2083199a7851 // indirect
+	github.com/dgryski/go-camellia v0.0.0-20191119043421-69a8a13fb23d // indirect
+	github.com/dgryski/go-idea v0.0.0-20170306091226-d2fb45a411fb // indirect
+	github.com/dgryski/go-rc2 v0.0.0-20150621095337-8a9021637152 // indirect
 	github.com/dunglas/httpsfv v1.0.2 // indirect
+	github.com/eknkc/basex v1.0.1 // indirect
+	github.com/mzz2017/disk-bloom v1.0.1 // indirect
 	github.com/quic-go/quic-go v0.59.0 // indirect
+	gitlab.com/yawning/chacha20.git v0.0.0-20230427033715-7877545b1b37 // indirect
 )
 
 require (
