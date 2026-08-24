@@ -30,6 +30,9 @@ const (
 	StrategyConsistentHashing = "consistent-hashing"
 	StrategyStickySessions    = "sticky-sessions"
 	StrategyLowestDelay       = "lowest-delay"
+	// Order is preference, delay is only a liveness signal. See priority.go
+	// for why "fastest" is the wrong question when a censor throttles a node.
+	StrategyPriority = "priority"
 )
 
 type Balancer struct {
@@ -100,6 +103,8 @@ func (s *Balancer) Start() error {
 		s.strategyFn = NewStickySession(outbounds, s.options)
 	case StrategyLowestDelay:
 		s.strategyFn = NewLowestDelay(outbounds, s.options)
+	case StrategyPriority:
+		s.strategyFn = NewPriority(outbounds, s.options)
 	default:
 		return E.New("unknown load balance strategy: ", s.options.Strategy)
 	}
