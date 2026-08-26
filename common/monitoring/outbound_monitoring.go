@@ -290,7 +290,16 @@ func (m *OutboundMonitoring) Start(stage adapter.StartStage) error {
 		}
 		for tag, outbound := range m.outbounds {
 			for _, dep := range outbound.dependencies {
-				m.outbounds[dep].dependenciesInverse = append(m.outbounds[dep].dependenciesInverse, tag)
+				// A dependency can name an outbound that is not being
+				// monitored — a detour to a group, or a config that lists only
+				// some members. Indexing blindly then nil-derefs and takes the
+				// whole core down at startup, which looks to the user like the
+				// app simply refusing to connect.
+				depOut, ok := m.outbounds[dep]
+				if !ok || depOut == nil {
+					continue
+				}
+				depOut.dependenciesInverse = append(depOut.dependenciesInverse, tag)
 			}
 		}
 
