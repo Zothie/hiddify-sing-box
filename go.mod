@@ -5,6 +5,7 @@ go 1.21.4
 toolchain go1.21.12
 
 require (
+	github.com/zeebo/blake3 v0.2.4
 	berty.tech/go-libtor v1.0.385
 	github.com/caddyserver/certmagic v0.20.0
 	github.com/cloudflare/circl v1.4.0
