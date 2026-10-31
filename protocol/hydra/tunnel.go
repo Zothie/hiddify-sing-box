@@ -501,5 +501,8 @@ func buildTLSConfigAndDialer(ctx context.Context, logger log.ContextLogger, base
 	if len(tlsConfig.NextProtos()) == 0 {
 		tlsConfig.SetNextProtos([]string{"http/1.1"})
 	}
-	return tls.NewDialer(baseDialer, tlsConfig), nil
+	// Fragment the ClientHello on the wire (NoDPI-style): the relay SNI is
+	// deliberately non-whitelisted, so the first record must not arrive as a
+	// single inspectable TLS record.
+	return splitDialer{Dialer: tls.NewDialer(baseDialer, tlsConfig)}, nil
 }
