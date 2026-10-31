@@ -36,11 +36,16 @@ const (
 	TypeCCM          = "ccm"
 	TypeOCM          = "ocm"
 
-	TypeHInvalidConfig = "hinvalid" //H
-	TypeXray           = "xray"     //H
-	TypeCustom         = "custom"   //H
-	TypeAwg            = "awg"      //H
-	TypeBalancer       = "balancer" //H
+	TypeHInvalidConfig = "hinvalid"       //H
+	TypeXray           = "xray"           //H
+	TypeCustom         = "custom"         //H
+	TypeAwg            = "awg"            //H
+	TypeBalancer       = "balancer"       //H
+	TypeDNSTT          = "dnstt"          //H
+	TypeMasterDNS      = "masterdns"      //H
+	TypeGooseRelay     = "gooserelay"     //H
+	TypeHydra          = "hydra"          //H
+	TypeSmartDNSPool   = "smart_dns_pool" //H — local recursive-resolver pool with AIMD throttling + recovery probing (github.com/hiddify/hmrd_multi_resolver_dns)
 )
 
 const (
@@ -120,6 +125,14 @@ func ProxyDisplayName(proxyType string) string {
 		return "Awg"
 	case TypeBalancer:
 		return "Balancer"
+	case TypeDNSTT:
+		return "DNSTT"
+	case TypeMasterDNS:
+		return "MasterDNS"
+	case TypeGooseRelay:
+		return "GooseRelay"
+	case TypeHydra:
+		return "Hydra"
 	default:
 		return "Unknown"
 	}

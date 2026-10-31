@@ -23,6 +23,7 @@ require (
 	github.com/libdns/alidns v1.0.6-beta.3
 	github.com/libdns/cloudflare v0.2.2
 	github.com/logrusorgru/aurora v2.0.3+incompatible
+	github.com/mahsanet/dnstt v0.0.0-20260208072932-d75b50056612
 	github.com/metacubex/utls v1.8.4
 	github.com/mholt/acmez/v3 v3.1.4
 	github.com/miekg/dns v1.1.69
@@ -53,6 +54,7 @@ require (
 	github.com/stretchr/testify v1.11.1
 	github.com/tidwall/gjson v1.18.0
 	github.com/vishvananda/netns v0.0.5
+	github.com/zeebo/blake3 v0.2.4
 	go.uber.org/zap v1.27.1
 	go4.org/netipx v0.0.0-20231129151722-fdeea329fbba
 	golang.org/x/crypto v0.46.0
@@ -147,7 +149,6 @@ require (
 	github.com/klauspost/reedsolomon v1.12.0 // indirect
 	github.com/libdns/libdns v1.1.1 // indirect
 	github.com/libp2p/go-reuseport v0.4.0 // indirect
-	github.com/mahsanet/dnstt v0.0.0-20260208072932-d75b50056612 // indirect
 	github.com/marusama/semaphore v0.0.0-20171214154724-565ffd8e868a // indirect
 	github.com/mdlayher/netlink v1.7.3-0.20250113171957-fbb4dce95f42 // indirect
 	github.com/mdlayher/socket v0.5.1 // indirect
@@ -227,7 +228,6 @@ require (
 	github.com/x448/float16 v0.8.4 // indirect
 	github.com/xtaci/kcp-go/v5 v5.6.8 // indirect
 	github.com/xtaci/smux v1.5.24 // indirect
-	github.com/zeebo/blake3 v0.2.4 // indirect
 	gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/goptlib v1.5.0 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
 	go.uber.org/zap/exp v0.3.0 // indirect
