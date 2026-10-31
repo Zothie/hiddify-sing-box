@@ -31,6 +31,7 @@ import (
 
 	"github.com/sagernet/sing-box/protocol/hiddify/xray"
 	"github.com/sagernet/sing-box/protocol/http"
+	"github.com/sagernet/sing-box/protocol/hydra"
 	"github.com/sagernet/sing-box/protocol/mieru"
 	"github.com/sagernet/sing-box/protocol/mixed"
 	"github.com/sagernet/sing-box/protocol/naive"
@@ -114,6 +115,7 @@ func OutboundRegistry() *outbound.Registry {
 	dnstt.RegisterOutbound(registry)
 	masterdns.RegisterOutbound(registry)
 	gooserelay.RegisterOutbound(registry)
+	hydra.RegisterOutbound(registry)
 	balancer.RegisterLoadBalance(registry)
 
 	registerQUICOutbounds(registry)
