@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -39,7 +40,8 @@ import (
 func TestExternalControlChain(t *testing.T) {
 	daemon := os.Getenv("HYDRA_CHAIN_DAEMON")
 	onion := os.Getenv("HYDRA_CHAIN_ONION")
-	if daemon == "" || onion == "" {
+	offline := os.Getenv("HYDRA_CHAIN_BUNDLED_CATALOGUE") != ""
+	if !offline && (daemon == "" || onion == "") {
 		t.Skip("external control chain not requested")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
@@ -95,7 +97,13 @@ func TestExternalControlChain(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	cat, err := LoadAndVerifyCatalogue(catalogueBytes, sig, rootPub, uint64(time.Now().Unix()), 0)
+	// The wire carries the detached signature as hex text (128 chars); the
+	// verifier needs the decoded 64 bytes.
+	sigBytes, err := hex.DecodeString(strings.TrimSpace(string(sig)))
+	if err != nil || len(sigBytes) != 64 {
+		t.Fatalf("bad signature encoding: %v", err)
+	}
+	cat, err := LoadAndVerifyCatalogue(catalogueBytes, sigBytes, rootPub, uint64(time.Now().Unix()), 0)
 	if err != nil {
 		t.Fatalf("catalogue rejected: %v", err)
 	}
