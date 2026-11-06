@@ -49,34 +49,51 @@ func TestExternalControlChain(t *testing.T) {
 	if err != nil || len(rootPub) != 32 {
 		t.Fatal("invalid root pubkey")
 	}
-	client, err := controlclient.Start(ctx, controlclient.Config{
-		DaemonPath:   daemon,
-		SocksAddr:    "127.0.0.1:19051",
-		DataDir:      filepath.Join(t.TempDir(), "tor-data"),
-		ControlOnion: onion,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer client.Close()
-	deadline := time.Now().Add(3 * time.Minute)
-	for !client.Ready() {
-		if time.Now().After(deadline) {
-			t.Fatal("tor bootstrap deadline exceeded")
+	// Offline mode exercises the CONTROL_UNAVAILABLE path: the bundled signed
+	// catalogue is the only allowed source when Tor bootstrap fails. There is
+	// still no unsigned or clearnet fallback anywhere.
+	control := "tor-onion"
+	var catalogueBytes, sig []byte
+	if offline := os.Getenv("HYDRA_CHAIN_BUNDLED_CATALOGUE"); offline != "" {
+		control = "offline-bundled"
+		catalogueBytes, err = os.ReadFile(offline)
+		if err != nil {
+			t.Fatal(err)
 		}
-		select {
-		case state := <-client.BootstrapStates():
-			t.Logf("bootstrap: %+v", state)
-		case <-time.After(time.Second):
+		sig, err = os.ReadFile(os.Getenv("HYDRA_CHAIN_BUNDLED_SIG"))
+		if err != nil {
+			t.Fatal(err)
 		}
-	}
-	catalogueBytes, err := client.FetchCatalogue(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	sig, err := client.FetchPath(ctx, "/catalogue.sig")
-	if err != nil {
-		t.Fatal(err)
+	} else {
+		client, err := controlclient.Start(ctx, controlclient.Config{
+			DaemonPath:   daemon,
+			SocksAddr:    "127.0.0.1:19051",
+			DataDir:      filepath.Join(t.TempDir(), "tor-data"),
+			ControlOnion: onion,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer client.Close()
+		deadline := time.Now().Add(3 * time.Minute)
+		for !client.Ready() {
+			if time.Now().After(deadline) {
+				t.Fatal("tor bootstrap deadline exceeded")
+			}
+			select {
+			case state := <-client.BootstrapStates():
+				t.Logf("bootstrap: %+v", state)
+			case <-time.After(time.Second):
+			}
+		}
+		catalogueBytes, err = client.FetchCatalogue(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sig, err = client.FetchPath(ctx, "/catalogue.sig")
+		if err != nil {
+			t.Fatal(err)
+		}
 	}
 	cat, err := LoadAndVerifyCatalogue(catalogueBytes, sig, rootPub, uint64(time.Now().Unix()), 0)
 	if err != nil {
@@ -180,6 +197,7 @@ func TestExternalControlChain(t *testing.T) {
 		"candidates": len(candidates),
 		"skips":      skips,
 		"proof":      "integrity-ok-131072",
+		"control":    control,
 		"onion":      onion,
 	})
 	fmt.Println("HYDRA_CONTROL_CHAIN " + string(report))
