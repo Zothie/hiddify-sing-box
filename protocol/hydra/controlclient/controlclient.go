@@ -28,6 +28,7 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -84,6 +85,11 @@ type Client struct {
 	ready   bool
 	gen     int    // incremented on every daemon spawn (restart detection)
 	annAddr string // socks addr announced by the daemon (for port 0 configs)
+
+	// alive mirrors cmd.ProcessState without racing cmd.Wait: the supervisor
+	// clears it after Wait returns, fetches check it instead of touching
+	// ProcessState directly.
+	alive   atomic.Bool
 	stopped bool
 	stopErr error
 }
@@ -155,9 +161,15 @@ func (c *Client) generation() int {
 // the control onion circuit and returns the raw response body bytes. It never
 // falls back to a direct connection.
 func (c *Client) FetchCatalogue(ctx context.Context) ([]byte, error) {
+	return c.FetchPath(ctx, "/catalogue")
+}
+
+// FetchPath fetches an arbitrary path on the control onion through the
+// daemon's Tor-only SOCKS; there is no direct-net fallback on this path.
+func (c *Client) FetchPath(ctx context.Context, path string) ([]byte, error) {
 	c.mu.Lock()
 	cmd := c.cmd
-	alive := cmd != nil && cmd.ProcessState == nil
+	alive := cmd != nil && c.alive.Load()
 	socks := c.cfg.SocksAddr
 	if c.cfg.port() == 0 && c.annAddr != "" {
 		socks = c.annAddr
@@ -172,7 +184,7 @@ func (c *Client) FetchCatalogue(ctx context.Context) ([]byte, error) {
 		return nil, fmt.Errorf("controlclient: socks dial: %w", err)
 	}
 	defer conn.Close()
-	return httpGetCatalogue(ctx, conn, c.onionHost)
+	return httpGetPath(ctx, conn, c.onionHost, path)
 }
 
 // Close kills the daemon and waits for the supervisor to stop.
@@ -225,6 +237,7 @@ func (c *Client) spawn() error {
 	c.ready = false
 	c.gen++
 	c.mu.Unlock()
+	c.alive.Store(true)
 
 	c.wg.Add(2)
 	go c.readStderr(stderr)
@@ -242,6 +255,7 @@ func (c *Client) supervise() {
 		cmd := c.cmd
 		c.mu.Unlock()
 		waitErr := cmd.Wait()
+		c.alive.Store(false)
 
 		select {
 		case <-c.ctx.Done():
@@ -451,10 +465,15 @@ func socksDial(ctx context.Context, socksAddr, host string, port int) (net.Conn,
 
 // httpGetCatalogue speaks plain HTTP/1.0 over the established SOCKS stream.
 func httpGetCatalogue(ctx context.Context, conn net.Conn, host string) ([]byte, error) {
+	return httpGetPath(ctx, conn, host, "/catalogue")
+}
+
+// httpGetPath speaks plain HTTP/1.0 for one path over the SOCKS stream.
+func httpGetPath(ctx context.Context, conn net.Conn, host, path string) ([]byte, error) {
 	if dl, ok := ctx.Deadline(); ok {
 		_ = conn.SetDeadline(dl)
 	}
-	req := fmt.Sprintf("GET /catalogue HTTP/1.0\r\nHost: %s\r\nConnection: close\r\n\r\n", host)
+	req := fmt.Sprintf("GET %s HTTP/1.0\r\nHost: %s\r\nConnection: close\r\n\r\n", path, host)
 	if _, err := conn.Write([]byte(req)); err != nil {
 		return nil, fmt.Errorf("catalogue request write: %w", err)
 	}
