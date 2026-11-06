@@ -54,7 +54,11 @@ func startRustServer(t *testing.T) (serverAddr string, pubkey [32]byte, stop fun
 	serverAddr = net.JoinHostPort("127.0.0.1", fmt.Sprint(port))
 
 	var stderr bytes.Buffer
-	cmd := exec.Command(bin, encodeB64(sk), serverAddr)
+	keyPath := t.TempDir() + "/server.key"
+	if err := os.WriteFile(keyPath, []byte(encodeB64(sk)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(bin, keyPath, serverAddr)
 	cmd.Stderr = &stderr
 	cmd.Stdout = &stderr
 	cmd.Env = append(os.Environ(), "HYDRA_DEBUG=1")

@@ -303,7 +303,12 @@ func (t *Tunnel) openSession(ctx context.Context, host string, port uint16) (*se
 	frame = append(frame, byte(len(host)))
 	frame = append(frame, host...)
 	frame = binary.BigEndian.AppendUint16(frame, port)
-	if !t.send(frame) {
+	select {
+	case t.out <- frame:
+	case <-ctx.Done():
+		t.removeSession(id)
+		return nil, ctx.Err()
+	case <-t.done:
 		t.removeSession(id)
 		return nil, errTunnelReset
 	}
@@ -357,6 +362,12 @@ func connectTunnel(ctx context.Context, dial DialFunc, requestURL *url.URL, head
 	raw, err := dial(ctx)
 	if err != nil {
 		return nil, E.Cause(err, "hydra: transport dial")
+	}
+	stopCancellation := context.AfterFunc(ctx, func() { _ = raw.Close() })
+	defer stopCancellation()
+	if err := ctx.Err(); err != nil {
+		_ = raw.Close()
+		return nil, err
 	}
 	conn := raw
 	// The HTTP upgrade itself has no ctx path (it reads/writes the raw conn),
@@ -462,6 +473,10 @@ func connectTunnel(ctx context.Context, dial DialFunc, requestURL *url.URL, head
 		return fail(E.New("hydra: server authentication failed (MITM or wrong pubkey)"))
 	}
 	_ = raw.SetReadDeadline(time.Time{})
+	if !stopCancellation() || ctx.Err() != nil {
+		_ = raw.Close()
+		return nil, ctx.Err()
+	}
 
 	tunnel := &Tunnel{
 		raw:      raw,

@@ -66,6 +66,20 @@ func NewDefault(ctx context.Context, options option.DialerOptions) (*DefaultDial
 	} else {
 		interfaceFinder = control.NewDefaultInterfaceFinder()
 	}
+	// Platform socket protection is independent of interface selection. In
+	// particular Android disables auto-detection but still requires protection.
+	requireProtection := platformInterface != nil && platformInterface.UsePlatformAutoDetectInterfaceControl()
+	if requireProtection {
+		if networkManager == nil {
+			return nil, E.New("required platform socket protection: missing network manager")
+		}
+		protectFunc := networkManager.ProtectFunc()
+		if protectFunc == nil {
+			return nil, E.New("required platform socket protection: missing control hook")
+		}
+		dialer.Control = control.Append(dialer.Control, protectFunc)
+		listener.Control = control.Append(listener.Control, protectFunc)
+	}
 	if options.BindInterface != "" {
 		if !(C.IsLinux || C.IsDarwin || C.IsWindows) {
 			return nil, E.New("`bind_interface` is only supported on Linux, macOS and Windows")
@@ -112,9 +126,11 @@ func NewDefault(ctx context.Context, options option.DialerOptions) (*DefaultDial
 					networkStrategy = common.Ptr(C.NetworkStrategyDefault)
 					defaultNetworkStrategy = true
 				}
-				bindFunc := networkManager.ProtectFunc()
-				dialer.Control = control.Append(dialer.Control, bindFunc)
-				listener.Control = control.Append(listener.Control, bindFunc)
+				if !requireProtection {
+					bindFunc := networkManager.ProtectFunc()
+					dialer.Control = control.Append(dialer.Control, bindFunc)
+					listener.Control = control.Append(listener.Control, bindFunc)
+				}
 			} else {
 				bindFunc := networkManager.AutoDetectInterfaceFunc()
 				dialer.Control = control.Append(dialer.Control, bindFunc)

@@ -151,7 +151,11 @@ func (s *session) Close() error {
 		frame := make([]byte, 0, 1+IDSize)
 		frame = append(frame, 1)
 		frame = append(frame, s.id[:]...)
-		s.tun.send(frame)
+		select {
+		case s.tun.out <- frame:
+		default:
+			// Local cleanup must not wait on a stalled shared tunnel.
+		}
 	})
 	return nil
 }
@@ -295,7 +299,11 @@ func (u *udpSession) Close() error {
 		frame := make([]byte, 0, 1+IDSize)
 		frame = append(frame, 1)
 		frame = append(frame, u.id[:]...)
-		u.tun.send(frame)
+		select {
+		case u.tun.out <- frame:
+		default:
+			// Local cleanup must not wait on a stalled shared tunnel.
+		}
 	})
 	return nil
 }

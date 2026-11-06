@@ -2,6 +2,7 @@ package hydra
 
 import (
 	"context"
+	"github.com/sagernet/sing-box/protocol/hydra/adaptive"
 	"net"
 	"net/http"
 	"net/url"
@@ -32,7 +33,8 @@ var _ adapter.Outbound = (*Outbound)(nil)
 // connection point).
 type Outbound struct {
 	outbound.Adapter
-	logger log.ContextLogger
+	logger   log.ContextLogger
+	adaptive *adaptive.Coordinator
 
 	dialer     N.Dialer
 	serverAddr M.Socksaddr
@@ -46,6 +48,13 @@ type Outbound struct {
 }
 
 func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.HydraOutboundOptions) (adapter.Outbound, error) {
+	if options.Adaptive != nil {
+		return newAdaptiveOutbound(ctx, router, logger, tag, options)
+	}
+	return newStaticOutbound(ctx, logger, tag, options, nil)
+}
+
+func newStaticOutbound(ctx context.Context, logger log.ContextLogger, tag string, options option.HydraOutboundOptions, outboundDialer N.Dialer) (adapter.Outbound, error) {
 	pubRaw, err := decodeB64(options.Pubkey)
 	if err != nil {
 		return nil, E.Cause(err, "decode hydra pubkey")
@@ -53,9 +62,11 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 	if len(pubRaw) != 32 {
 		return nil, E.New("hydra pubkey must decode to 32 bytes, got ", len(pubRaw))
 	}
-	outboundDialer, err := dialer.New(ctx, options.DialerOptions, options.ServerIsDomain())
-	if err != nil {
-		return nil, err
+	if outboundDialer == nil {
+		outboundDialer, err = dialer.New(ctx, options.DialerOptions, options.ServerIsDomain())
+		if err != nil {
+			return nil, err
+		}
 	}
 	serverAddr := options.ServerOptions.Build()
 	if serverAddr.Port == 0 {
@@ -109,6 +120,19 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 // getTunnel returns the live tunnel, rebuilding it (serialized) when dead.
 func (o *Outbound) getTunnel(ctx context.Context) (*Tunnel, error) {
 	o.mu.Lock()
+	if o.adaptive != nil {
+		c := o.adaptive
+		closed := o.isClosed
+		o.mu.Unlock()
+		if closed {
+			return nil, E.New("hydra: outbound closed")
+		}
+		r, err := c.Acquire(ctx)
+		if err != nil {
+			return nil, err
+		}
+		return r.(*Tunnel), nil
+	}
 	defer o.mu.Unlock()
 	if o.isClosed {
 		return nil, E.New("hydra: outbound closed")
@@ -173,10 +197,15 @@ func (o *Outbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (n
 
 func (o *Outbound) Close() error {
 	o.mu.Lock()
-	defer o.mu.Unlock()
 	o.isClosed = true
-	if o.tunnel != nil {
-		o.tunnel.kill(nil)
+	t, c := o.tunnel, o.adaptive
+	o.tunnel = nil
+	o.mu.Unlock()
+	if c != nil {
+		return c.Close()
+	}
+	if t != nil {
+		t.kill(nil)
 	}
 	return nil
 }
