@@ -41,4 +41,12 @@ type HydraOutboundOptions struct {
 	// client, whose server authentication is the pubkey-bound
 	// "hydra-confirm" CONFIRM frame rather than the TLS layer.
 	TLS *OutboundTLSOptions `json:"tls,omitempty"`
+
+	// NegotiateMaxFrame enables session negotiation (frame types 8/9/10):
+	// after CONFIRM and before the first OPEN the client offers this maximum
+	// total frame size (payload + 17 B overhead). Valid 1024..=65536; 0
+	// (default) disables negotiation and keeps the legacy wire format
+	// byte-identical. A server that ignores the unknown frame type causes a
+	// silent legacy fallback after 5 s; a REJECT never fails the tunnel.
+	NegotiateMaxFrame uint32 `json:"negotiate_max_frame,omitempty"`
 }

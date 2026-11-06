@@ -42,6 +42,10 @@ type Outbound struct {
 	headers    http.Header
 	pubkey     [32]byte
 
+	// negotiateMaxFrame is the parent negotiate_max_frame option (0 =
+	// disabled legacy behavior).
+	negotiateMaxFrame uint32
+
 	mu       sync.Mutex
 	tunnel   *Tunnel
 	isClosed bool
@@ -67,6 +71,9 @@ func newStaticOutbound(ctx context.Context, logger log.ContextLogger, tag string
 		if err != nil {
 			return nil, err
 		}
+	}
+	if options.NegotiateMaxFrame != 0 && (options.NegotiateMaxFrame < maxFrameMin || options.NegotiateMaxFrame > maxFrameMax) {
+		return nil, E.New("hydra: negotiate_max_frame must be 0 or 1024..=65536")
 	}
 	serverAddr := options.ServerOptions.Build()
 	if serverAddr.Port == 0 {
@@ -107,13 +114,14 @@ func newStaticOutbound(ctx context.Context, logger log.ContextLogger, tag string
 	var pubkey [32]byte
 	copy(pubkey[:], pubRaw)
 	return &Outbound{
-		Adapter:    outbound.NewAdapterWithDialerOptions(C.TypeHydra, tag, []string{N.NetworkTCP, N.NetworkUDP}, options.DialerOptions),
-		logger:     logger,
-		dialer:     transportDialer,
-		serverAddr: serverAddr,
-		requestURL: requestURL,
-		headers:    headers,
-		pubkey:     pubkey,
+		Adapter:           outbound.NewAdapterWithDialerOptions(C.TypeHydra, tag, []string{N.NetworkTCP, N.NetworkUDP}, options.DialerOptions),
+		logger:            logger,
+		dialer:            transportDialer,
+		serverAddr:        serverAddr,
+		requestURL:        requestURL,
+		headers:           headers,
+		pubkey:            pubkey,
+		negotiateMaxFrame: options.NegotiateMaxFrame,
 	}, nil
 }
 
@@ -148,7 +156,13 @@ func (o *Outbound) getTunnel(ctx context.Context) (*Tunnel, error) {
 	dialFn := func(c context.Context) (net.Conn, error) {
 		return o.dialer.DialContext(c, N.NetworkTCP, o.serverAddr)
 	}
-	t, err := connectTunnel(ctx, dialFn, &o.requestURL, o.headers, o.pubkey[:], o.logger)
+	var t *Tunnel
+	var err error
+	if o.negotiateMaxFrame != 0 {
+		t, err = connectTunnelNegotiate(ctx, dialFn, &o.requestURL, o.headers, o.pubkey[:], o.logger, o.negotiateMaxFrame)
+	} else {
+		t, err = connectTunnel(ctx, dialFn, &o.requestURL, o.headers, o.pubkey[:], o.logger)
+	}
 	if err != nil {
 		return nil, err
 	}

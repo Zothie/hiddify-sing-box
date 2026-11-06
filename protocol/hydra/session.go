@@ -128,17 +128,40 @@ func (s *session) Write(b []byte) (int, error) {
 	if v := s.writeDeadline.Load(); v != 0 {
 		deadline = deadlineChan(v)
 	}
+	// chunkLimit splits negotiated connections at min(16384, maxFrame-17)
+	// (negotiate.rs data_chunk_cap); legacy connections keep the single
+	// frame per Write path (0 = unchunked).
+	limit := s.tun.chunkLimit()
+	if limit == 0 {
+		if err := s.writeData(b, deadline); err != nil {
+			return 0, err
+		}
+		return len(b), nil
+	}
+	written := 0
+	for start := 0; start < len(b); start += limit {
+		end := min(start+limit, len(b))
+		if err := s.writeData(b[start:end], deadline); err != nil {
+			return written, err
+		}
+		written = end
+	}
+	return written, nil
+}
+
+// writeData sends one DATA [2][id16][bytes] frame on the tunnel.
+func (s *session) writeData(b []byte, deadline <-chan time.Time) error {
 	frame := make([]byte, 0, 1+IDSize+len(b))
 	frame = append(frame, 2)
 	frame = append(frame, s.id[:]...)
 	frame = append(frame, b...)
 	select {
 	case s.tun.out <- frame:
-		return len(b), nil
+		return nil
 	case <-s.tun.done:
-		return 0, errTunnelReset
+		return errTunnelReset
 	case <-deadline:
-		return 0, os.ErrDeadlineExceeded
+		return os.ErrDeadlineExceeded
 	}
 }
 

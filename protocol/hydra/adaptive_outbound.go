@@ -117,7 +117,7 @@ func newAdaptiveOutboundWithDependencies(ctx context.Context, router adapter.Rou
 		if base == nil {
 			return nil, fmt.Errorf("hydra: nil candidate dialer")
 		}
-		child, e := newStaticOutbound(ctx, logger, tag, option.HydraOutboundOptions{ServerOptions: v.ServerOptions, DialerOptions: v.DialerOptions, Pubkey: options.Pubkey, Path: v.Path, TLS: tlsOptions}, base)
+		child, e := newStaticOutbound(ctx, logger, tag, option.HydraOutboundOptions{ServerOptions: v.ServerOptions, DialerOptions: v.DialerOptions, Pubkey: options.Pubkey, Path: v.Path, TLS: tlsOptions, NegotiateMaxFrame: options.NegotiateMaxFrame}, base)
 		if e != nil {
 			return nil, e
 		}

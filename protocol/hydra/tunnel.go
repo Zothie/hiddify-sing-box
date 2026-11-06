@@ -68,6 +68,20 @@ type Tunnel struct {
 
 	logger log.ContextLogger
 
+	// Session negotiation (negotiate.go). negCh carries decrypted 9/10
+	// frames from the reader to the single negotiation waiter; the delivery
+	// is non-blocking, so a late duplicate can never stall the reader.
+	negCh chan []byte
+	neg   clientNegotiation
+	// maxFrame is the negotiated maximum total frame size; 0 = legacy
+	// (unchunked writes, byte-identical to pre-negotiation behavior).
+	// Written only by negotiate() inside connectTunnelOffer before the
+	// tunnel is handed out, read by sessions afterwards.
+	maxFrame uint32
+	// negotiationResult records how the negotiation settled (accepted /
+	// rejected reason / timeout fallback) for logs and tests.
+	negotiationResult string
+
 	mu       sync.Mutex
 	sessions map[[IDSize]byte]*session
 	udp      map[[IDSize]byte]*udpSession
@@ -257,6 +271,9 @@ func (t *Tunnel) route(plain []byte) {
 		case u.data <- udpPacket{addr: addr, payload: payload}:
 		default:
 		}
+	case 9, 10: // ACCEPT / REJECT negotiation replies (negotiate.go)
+		t.deliverNegotiation(plain)
+	case 8: // NEGOTIATE is client->server only; a compliant server never sends it
 	}
 }
 
@@ -356,6 +373,19 @@ func (t *Tunnel) openUDP() *udpSession {
 // the reader/writer pumps. dial must return the (TLS-wrapped) transport conn;
 // requestURL carries scheme (ws/wss), Host header and path.
 func connectTunnel(ctx context.Context, dial DialFunc, requestURL *url.URL, headers http.Header, serverStatic []byte, logger log.ContextLogger) (*Tunnel, error) {
+	return connectTunnelOffer(ctx, dial, requestURL, headers, serverStatic, logger, nil)
+}
+
+// connectTunnelNegotiate is connectTunnel plus session negotiation offering
+// maxFrame (frame types 8/9/10, negotiate.go). Values outside 1024..=65536
+// disable negotiation instead of producing an invalid offer.
+func connectTunnelNegotiate(ctx context.Context, dial DialFunc, requestURL *url.URL, headers http.Header, serverStatic []byte, logger log.ContextLogger, maxFrame uint32) (*Tunnel, error) {
+	return connectTunnelOffer(ctx, dial, requestURL, headers, serverStatic, logger, buildNegotiate(maxFrame))
+}
+
+// connectTunnelOffer is the shared connectTunnel body; offer carries a
+// prebuilt NEGOTIATE frame (nil = no negotiation).
+func connectTunnelOffer(ctx context.Context, dial DialFunc, requestURL *url.URL, headers http.Header, serverStatic []byte, logger log.ContextLogger, offer []byte) (*Tunnel, error) {
 	ctx, cancel := context.WithTimeout(ctx, handshakeTimeout)
 	defer cancel()
 
@@ -487,10 +517,16 @@ func connectTunnel(ctx context.Context, dial DialFunc, requestURL *url.URL, head
 		logger:   logger,
 		sessions: make(map[[IDSize]byte]*session),
 		udp:      make(map[[IDSize]byte]*udpSession),
+		negCh:    make(chan []byte, 4),
 	}
 	tunnel.ctr.Store(1) // client data frames start at 1
 	go tunnel.writerLoop()
 	go tunnel.readerLoop()
+	if offer != nil {
+		// After CONFIRM and before any OPEN: send the offer and settle
+		// ACCEPT/REJECT/timeout (negotiate.go). Never fails the tunnel.
+		tunnel.negotiate(offer, logger)
+	}
 	return tunnel, nil
 }
 
