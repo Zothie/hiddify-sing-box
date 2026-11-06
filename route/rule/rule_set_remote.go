@@ -103,6 +103,11 @@ func (s *RemoteRuleSet) StartContext(ctx context.Context, startContext *adapter.
 		}
 	}
 	s.updateTicker = time.NewTicker(s.updateInterval)
+	// The startup retry ticker must exist before loopUpdate runs: when the
+	// initial fetch fails, lastUpdated stays zero and loopUpdate blocks on
+	// startupTicker.C - a nil *time.Ticker here panics the whole process
+	// (SIGABRT via gomobile) a few seconds after start.
+	s.startupTicker = time.NewTicker(3 * time.Second)
 	return nil
 }
 
