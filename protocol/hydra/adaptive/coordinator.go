@@ -44,6 +44,56 @@ type Snapshot struct {
 
 var ErrClosed = errors.New("adaptive coordinator closed")
 
+// maxTrackedFailures caps the failure score so a long-dead candidate is only
+// demoted, never permanently exiled from the fair rotation.
+const maxTrackedFailures = 8
+
+// pickScored returns the next candidate: fewest attempts first (fairness
+// floor — every candidate is retried before any is retried twice), then
+// fewest tracked failures (score priority), then config order. Deterministic
+// by construction; no randomness, no starvation.
+func (c *Coordinator) pickScored() Candidate {
+	best := c.cfg.Candidates[0]
+	bestAttempts, bestFailures := c.scoreOf(best.ID)
+	for _, candidate := range c.cfg.Candidates[1:] {
+		attempts, failures := c.scoreOf(candidate.ID)
+		if attempts < bestAttempts || attempts == bestAttempts && failures < bestFailures {
+			best, bestAttempts, bestFailures = candidate, attempts, failures
+		}
+	}
+	return best
+}
+
+func (c *Coordinator) scoreOf(id string) (attempts, failures int) {
+	if s, ok := c.stats[id]; ok {
+		return s.attempts, s.failures
+	}
+	return 0, 0
+}
+
+func (c *Coordinator) stat(id string) *candStat {
+	s, ok := c.stats[id]
+	if !ok {
+		s = &candStat{}
+		c.stats[id] = s
+	}
+	return s
+}
+
+type candStat struct {
+	attempts int
+	failures int
+}
+
+func indexOfCandidate(candidates []Candidate, id string) int {
+	for i, candidate := range candidates {
+		if candidate.ID == id {
+			return i
+		}
+	}
+	return -1
+}
+
 // isNilResource reports plain nil and typed nil pointers. A typed nil inside
 // the Resource interface would pass the == nil check and crash on Close.
 func isNilResource(r Resource) bool {
@@ -74,6 +124,7 @@ type Coordinator struct {
 	preferred        bool
 	degraded         bool
 	lastPrewarm      time.Time
+	stats            map[string]*candStat
 }
 
 func New(parent context.Context, cfg Config) (*Coordinator, error) {
@@ -105,7 +156,7 @@ func New(parent context.Context, cfg Config) (*Coordinator, error) {
 	}
 	ctx, cancel := context.WithCancel(parent)
 	g, gcancel := context.WithCancel(ctx)
-	c := &Coordinator{cfg: cfg, ctx: ctx, cancel: cancel, generation: g, cancelGeneration: gcancel, changed: make(chan struct{}), wake: make(chan struct{}, 1), preferred: true, state: Snapshot{Generation: 1, LastGood: cfg.LastGood}}
+	c := &Coordinator{cfg: cfg, ctx: ctx, cancel: cancel, generation: g, cancelGeneration: gcancel, changed: make(chan struct{}), wake: make(chan struct{}, 1), preferred: true, stats: make(map[string]*candStat), state: Snapshot{Generation: 1, LastGood: cfg.LastGood}}
 	context.AfterFunc(ctx, func() { c.Close() })
 	go c.run()
 	return c, nil
@@ -340,16 +391,32 @@ func (c *Coordinator) run() {
 			}
 			c.preferred = false
 		} else {
+			// UCB-lite priority with a fairness floor: among candidates the
+			// scheduler has tried least often (round-robin aging), prefer the
+			// ones that failed least; equal scores keep config order, so the
+			// first-ever epoch follows the configured wss-first doctrine and
+			// no candidate can starve.
+			v = c.pickScored()
+			if index := indexOfCandidate(c.cfg.Candidates, v.ID); index >= 0 {
+				c.next = (index + 1) % len(c.cfg.Candidates)
+			}
 			c.preferred = false
-			c.next = (c.next + 1) % len(c.cfg.Candidates)
 		}
 		c.state.Attempts++
+		c.stat(v.ID).attempts++
 		c.mu.Unlock()
 		ctx, cancel := context.WithTimeout(g, c.cfg.AttemptTimeout)
 		r, err := c.attempt(ctx, v)
 		cancel()
 		c.mu.Lock()
 		stale := c.state.Closed || gen != c.state.Generation || g.Err() != nil
+		if !stale {
+			if err == nil {
+				c.stat(v.ID).failures = 0
+			} else if c.stat(v.ID).failures < maxTrackedFailures {
+				c.stat(v.ID).failures++
+			}
+		}
 		if !stale && err == nil {
 			select {
 			case <-r.Done():

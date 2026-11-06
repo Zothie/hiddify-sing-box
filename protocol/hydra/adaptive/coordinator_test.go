@@ -118,7 +118,10 @@ func TestFairBackoffAndVerifyCleanup(t *testing.T) {
 	if len(ids) != 12 {
 		t.Fatal(ids)
 	}
-	want := []string{"c", "a", "b", "c", "a", "b", "c", "a", "b", "c", "a", "b"}
+	// Scored fair rotation: last-good first, then one full epoch per candidate.
+	// After every candidate carries the same attempts/failures the tie-break
+	// returns to config order (a, b, c).
+	want := []string{"c", "a", "b", "a", "b", "c", "a", "b", "c", "a", "b", "c"}
 	for i := range want {
 		if ids[i] != want[i] {
 			t.Fatal(ids)
