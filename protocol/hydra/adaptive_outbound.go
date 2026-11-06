@@ -80,6 +80,10 @@ func newAdaptiveOutboundWithDependencies(ctx context.Context, router adapter.Rou
 		identity := v
 		identity.ID = ""
 		identity.Server = host
+		identity.Transport = normalizeTransport(identity.Transport)
+		if identity.Transport != transportWSS && identity.Transport != transportRTC {
+			return nil, fmt.Errorf("hydra: candidate %q: unknown transport %q", v.ID, v.Transport)
+		}
 		if identity.Path == "" {
 			identity.Path = "/"
 		} else if !strings.HasPrefix(identity.Path, "/") {
@@ -117,7 +121,7 @@ func newAdaptiveOutboundWithDependencies(ctx context.Context, router adapter.Rou
 		if base == nil {
 			return nil, fmt.Errorf("hydra: nil candidate dialer")
 		}
-		child, e := newStaticOutbound(ctx, logger, tag, option.HydraOutboundOptions{ServerOptions: v.ServerOptions, DialerOptions: v.DialerOptions, Pubkey: options.Pubkey, Path: v.Path, TLS: tlsOptions, NegotiateMaxFrame: options.NegotiateMaxFrame}, base)
+		child, e := newStaticOutbound(ctx, logger, tag, option.HydraOutboundOptions{ServerOptions: v.ServerOptions, DialerOptions: v.DialerOptions, Pubkey: options.Pubkey, Path: v.Path, TLS: tlsOptions, Transport: v.Transport, NegotiateMaxFrame: options.NegotiateMaxFrame}, base)
 		if e != nil {
 			return nil, e
 		}
@@ -131,6 +135,11 @@ func newAdaptiveOutboundWithDependencies(ctx context.Context, router adapter.Rou
 	c, err := adaptive.New(ctx, adaptive.Config{Candidates: candidates, AttemptTimeout: attempt, Backoff: backoff, MaxBackoff: max,
 		Connect: func(ctx context.Context, v adaptive.Candidate) (adaptive.Resource, error) {
 			b := built[v.ID]
+			if b.rtcTransport {
+				return connectTunnelRTC(ctx, func(c context.Context) (net.PacketConn, error) {
+					return b.dialer.ListenPacket(c, b.serverAddr)
+				}, b.pubkey[:], b.serverAddr.AddrPort(), logger, b.negotiateMaxFrame)
+			}
 			t, err := connectTunnel(ctx, func(ctx context.Context) (net.Conn, error) {
 				return b.dialer.DialContext(ctx, N.NetworkTCP, b.serverAddr)
 			}, &b.requestURL, b.headers, b.pubkey[:], logger)

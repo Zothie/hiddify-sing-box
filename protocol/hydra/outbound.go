@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -22,6 +23,22 @@ import (
 
 func RegisterOutbound(registry *outbound.Registry) {
 	outbound.Register[option.HydraOutboundOptions](registry, C.TypeHydra, NewOutbound)
+}
+
+// Transport names for the option transport field ("wss" is the default when
+// empty).
+const (
+	transportWSS = "wss"
+	transportRTC = "rtc"
+)
+
+// normalizeTransport canonicalizes a transport value; "" means "wss".
+func normalizeTransport(s string) string {
+	s = strings.ToLower(strings.TrimSpace(s))
+	if s == "" {
+		return transportWSS
+	}
+	return s
 }
 
 var _ adapter.Outbound = (*Outbound)(nil)
@@ -41,6 +58,9 @@ type Outbound struct {
 	requestURL url.URL
 	headers    http.Header
 	pubkey     [32]byte
+	// rtcTransport routes getTunnel through the rtc:// pump instead of the
+	// ws handshake; dialer.ListenPacket provides the UDP socket then.
+	rtcTransport bool
 
 	// negotiateMaxFrame is the parent negotiate_max_frame option (0 =
 	// disabled legacy behavior).
@@ -80,36 +100,55 @@ func newStaticOutbound(ctx context.Context, logger log.ContextLogger, tag string
 		// Rust client defaults the port to 443 when the URL carries none.
 		serverAddr.Port = 443
 	}
-	transportDialer, err := buildTLSConfigAndDialer(ctx, logger, outboundDialer, serverAddr, options.TLS)
-	if err != nil {
-		return nil, err
-	}
 
-	path := options.Path
-	if path == "" {
-		path = "/"
-	}
-	if path[0] != '/' {
-		path = "/" + path
-	}
-	// The TCP transport dials serverAddr; the HTTP Host header (and SNI, via
-	// the TLS config) fronts the real hostname — mirrors the Rust
-	// wss://sni@ip:port/path URL shape.
-	hostHeader := serverAddr.AddrString()
-	if options.TLS != nil && options.TLS.Enabled && options.TLS.ServerName != "" {
-		hostHeader = options.TLS.ServerName
-	}
-	scheme := "ws"
-	if options.TLS != nil && options.TLS.Enabled {
-		scheme = "wss"
-	}
-	requestURL := url.URL{
-		Scheme: scheme,
-		Host:   net.JoinHostPort(hostHeader, strconv.Itoa(int(serverAddr.Port))),
-		Path:   path,
-	}
+	var transportDialer N.Dialer
+	var requestURL url.URL
 	headers := http.Header{}
 	headers.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36")
+	transport := normalizeTransport(options.Transport)
+	if transport != transportWSS && transport != transportRTC {
+		return nil, E.New("hydra: unknown transport ", options.Transport)
+	}
+	rtcTransport := transport == transportRTC
+	if rtcTransport {
+		// rtc:// has no websocket upgrade: no path, no TLS fronting. The
+		// Rust client's rtc:// scheme likewise ignores them.
+		if (options.Path != "" && options.Path != "/") || (options.TLS != nil && options.TLS.Enabled) {
+			if logger != nil {
+				logger.Debug("hydra rtc transport: ignoring path/tls options")
+			}
+		}
+		transportDialer = outboundDialer // UDP socket via dialer.ListenPacket
+	} else {
+		transportDialer, err = buildTLSConfigAndDialer(ctx, logger, outboundDialer, serverAddr, options.TLS)
+		if err != nil {
+			return nil, err
+		}
+
+		path := options.Path
+		if path == "" {
+			path = "/"
+		}
+		if path[0] != '/' {
+			path = "/" + path
+		}
+		// The TCP transport dials serverAddr; the HTTP Host header (and SNI, via
+		// the TLS config) fronts the real hostname — mirrors the Rust
+		// wss://sni@ip:port/path URL shape.
+		hostHeader := serverAddr.AddrString()
+		if options.TLS != nil && options.TLS.Enabled && options.TLS.ServerName != "" {
+			hostHeader = options.TLS.ServerName
+		}
+		scheme := "ws"
+		if options.TLS != nil && options.TLS.Enabled {
+			scheme = "wss"
+		}
+		requestURL = url.URL{
+			Scheme: scheme,
+			Host:   net.JoinHostPort(hostHeader, strconv.Itoa(int(serverAddr.Port))),
+			Path:   path,
+		}
+	}
 
 	var pubkey [32]byte
 	copy(pubkey[:], pubRaw)
@@ -121,6 +160,7 @@ func newStaticOutbound(ctx context.Context, logger log.ContextLogger, tag string
 		requestURL:        requestURL,
 		headers:           headers,
 		pubkey:            pubkey,
+		rtcTransport:      rtcTransport,
 		negotiateMaxFrame: options.NegotiateMaxFrame,
 	}, nil
 }
@@ -158,9 +198,14 @@ func (o *Outbound) getTunnel(ctx context.Context) (*Tunnel, error) {
 	}
 	var t *Tunnel
 	var err error
-	if o.negotiateMaxFrame != 0 {
+	switch {
+	case o.rtcTransport:
+		t, err = connectTunnelRTC(ctx, func(c context.Context) (net.PacketConn, error) {
+			return o.dialer.ListenPacket(c, o.serverAddr)
+		}, o.pubkey[:], o.serverAddr.AddrPort(), o.logger, o.negotiateMaxFrame)
+	case o.negotiateMaxFrame != 0:
 		t, err = connectTunnelNegotiate(ctx, dialFn, &o.requestURL, o.headers, o.pubkey[:], o.logger, o.negotiateMaxFrame)
-	} else {
+	default:
 		t, err = connectTunnel(ctx, dialFn, &o.requestURL, o.headers, o.pubkey[:], o.logger)
 	}
 	if err != nil {

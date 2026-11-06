@@ -14,9 +14,41 @@ import (
 
 	"github.com/sagernet/sing-box/common/dialer"
 	"github.com/sagernet/sing-box/option"
+	"github.com/sagernet/sing-box/protocol/hydra/adaptive"
 	"github.com/sagernet/sing/common/json/badoption"
 	N "github.com/sagernet/sing/common/network"
 )
+
+func TestAdaptiveOutboundRegistryWiring(t *testing.T) {
+	const tag = "registry-wired-outbound"
+	opts := option.HydraOutboundOptions{Pubkey: encodeB64(make([]byte, 32)), Adaptive: &option.HydraAdaptiveOptions{ProofURL: "https://example.com/proof", ProofBytes: 1024, Candidates: []option.HydraAdaptiveCandidateOptions{{ID: "a", ServerOptions: option.ServerOptions{Server: "127.0.0.1", ServerPort: 443}, Path: "/a"}}}}
+	a, err := newAdaptiveOutboundWithDependencies(t.Context(), nil, nil, tag, opts, adaptiveOutboundDependencies{DialerFactory: func(ctx context.Context, v option.HydraAdaptiveCandidateOptions) (N.Dialer, error) {
+		return dialer.New(ctx, v.DialerOptions, v.ServerIsDomain())
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	o := a.(*Outbound)
+	snap, ok := adaptive.SnapshotByTag(tag)
+	if !ok {
+		t.Fatal("adaptive outbound missing from registry after construction")
+	}
+	if snap.Closed || snap.Generation == 0 {
+		t.Fatalf("fresh coordinator snapshot = %+v", snap)
+	}
+	if err := o.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := adaptive.SnapshotByTag(tag); ok {
+		t.Fatal("adaptive outbound still registered after Close")
+	}
+	if err := o.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := adaptive.SnapshotByTag(tag); ok {
+		t.Fatal("registry entry resurrected by repeated Close")
+	}
+}
 
 func TestAdaptiveDistinctPaths(t *testing.T) {
 	opts := option.HydraOutboundOptions{Pubkey: encodeB64(make([]byte, 32)), Adaptive: &option.HydraAdaptiveOptions{ProofURL: "https://example.com/proof", ProofBytes: 1024, Candidates: []option.HydraAdaptiveCandidateOptions{{ID: "a", ServerOptions: option.ServerOptions{Server: "127.0.0.1", ServerPort: 443}, Path: "/a"}, {ID: "b", ServerOptions: option.ServerOptions{Server: "127.0.0.1", ServerPort: 443}, Path: "/b"}}}}

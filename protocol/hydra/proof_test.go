@@ -26,6 +26,7 @@ func proofTestBody(nonce string, size int) []byte {
 
 func TestCandidateProof(t *testing.T) {
 	serverAddr, pubkey, _ := startRustServer(t)
+	unblocked := make(chan struct{})
 	for _, mode := range []string{"valid", "corrupt", "truncated", "wrong-nonce", "redirect", "stall", "untrusted", "insecure-override", "servername-override"} {
 		t.Run(mode, func(t *testing.T) {
 			origin := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -52,6 +53,7 @@ func TestCandidateProof(t *testing.T) {
 					w.WriteHeader(http.StatusOK)
 					w.(http.Flusher).Flush()
 					<-r.Context().Done()
+					close(unblocked)
 					return
 				}
 				if mode == "corrupt" {
@@ -87,6 +89,15 @@ func TestCandidateProof(t *testing.T) {
 			}
 			if mode != "valid" && err == nil {
 				t.Fatalf("false success for %s response", mode)
+			}
+			if mode == "stall" {
+				// Cancelled proof must close the session server-side too, or the
+				// origin handler never sees a FIN and hangs forever.
+				select {
+				case <-unblocked:
+				case <-time.After(3 * time.Second):
+					t.Fatal("origin handler never saw the client disconnect")
+				}
 			}
 			if time.Since(start) > 3*time.Second {
 				t.Fatal("proof exceeded its total deadline")
