@@ -33,6 +33,10 @@ type Catalogue struct {
 	Servers     []CatalogueServer `json:"servers"`
 	Recipes     []CatalogueRecipe `json:"recipes"`
 	Revocations []string          `json:"revocations"`
+	// Hints warm-start per provider ASN (decimal key): recipe ids observed
+	// working there. Advisory only — every recipe still passes the client's
+	// own useful-byte proof before use.
+	Hints map[string][]string `json:"hints,omitempty"`
 }
 
 // CatalogueServer describes one hydra server and its endpoints.
@@ -205,7 +209,45 @@ func LoadAndVerifyCatalogue(payload []byte, sig []byte, rootPub ed25519.PublicKe
 		}
 	}
 
+	// 9. ASN hints: advisory, but structurally bounded and reference-checked.
+	if len(cat.Hints) > 64 {
+		return nil, &CatalogueError{Code: ErrCatalogueMalformed, Field: "hints"}
+	}
+	for asn, recipeIDs := range cat.Hints {
+		if asn == "" || len(asn) > 10 {
+			return nil, &CatalogueError{Code: ErrCatalogueMalformed, Field: "hints"}
+		}
+		for _, r := range asn {
+			if r < '0' || r > '9' {
+				return nil, &CatalogueError{Code: ErrCatalogueMalformed, Field: "hints"}
+			}
+		}
+		if len(recipeIDs) == 0 || len(recipeIDs) > 16 {
+			return nil, &CatalogueError{Code: ErrCatalogueMalformed, Field: "hints"}
+		}
+		for _, id := range recipeIDs {
+			found := false
+			for i := range cat.Recipes {
+				if cat.Recipes[i].ID == id {
+					found = true
+					break
+				}
+			}
+			if !found {
+				return nil, &CatalogueError{Code: ErrCatalogueMalformed, Field: "hints"}
+			}
+			if cat.IsRevoked(id) {
+				return nil, &CatalogueError{Code: ErrCatalogueRevoked, ID: id}
+			}
+		}
+	}
+
 	return &cat, nil
+}
+
+// HintRecipes returns the warm-start recipe ids recorded for an ASN, if any.
+func (c *Catalogue) HintRecipes(asn string) []string {
+	return c.Hints[asn]
 }
 
 // scalarMap reports whether every value in the map is a number or a string
