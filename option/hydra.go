@@ -3,7 +3,10 @@ package option
 import "github.com/sagernet/sing/common/json/badoption"
 
 type HydraAdaptiveCandidateOptions struct {
-	ID string `json:"id"`
+	ID                string `json:"id"`
+	RecipeID          string `json:"recipe_id,omitempty"`
+	Pubkey            string `json:"pubkey,omitempty"`
+	NegotiateMaxFrame uint32 `json:"negotiate_max_frame,omitempty"`
 	ServerOptions
 	DialerOptions
 	Path string              `json:"path,omitempty"`
@@ -14,6 +17,9 @@ type HydraAdaptiveCandidateOptions struct {
 }
 
 type HydraAdaptiveOptions struct {
+	// StatePath stores only a last-good hint scoped to the caller's physical network.
+	StatePath          string                          `json:"state_path,omitempty"`
+	NetworkKey         string                          `json:"network_key,omitempty"`
 	PhysicalDNSServers []string                        `json:"physical_dns_servers,omitempty"`
 	PhysicalInterface  string                          `json:"physical_interface,omitempty"`
 	Candidates         []HydraAdaptiveCandidateOptions `json:"candidates"`
@@ -22,6 +28,35 @@ type HydraAdaptiveOptions struct {
 	AttemptTimeout     badoption.Duration              `json:"attempt_timeout,omitempty"`
 	Backoff            badoption.Duration              `json:"backoff,omitempty"`
 	MaxBackoff         badoption.Duration              `json:"max_backoff,omitempty"`
+	// RecoveryBudget bounds one full candidate epoch after a tunnel loss:
+	// len(candidates) x AttemptTimeout must fit inside it or the config
+	// build fails. Default 30s — the production mandate is a verified stable
+	// connection restored within 30 s of a tunnel timeout whenever an
+	// allowed recipe works and sits anywhere in the first epoch order.
+	RecoveryBudget badoption.Duration `json:"recovery_budget,omitempty"`
+	// ReferenceURLs lists up to three https origins that decide blackout:
+	// after a full candidate epoch where no attempt reached a handshake, one
+	// bounded HTTPS GET per reference runs through the physical dialer; when
+	// all fail, the physical internet is assumed dead and candidate attempts
+	// stop until a reference answers again. Empty (default) disables blackout
+	// detection. Domain references need physical_dns_servers to resolve.
+	ReferenceURLs []string `json:"reference_urls,omitempty"`
+	// BlackoutRecheck is the wait between reference rechecks while blackout
+	// is active. Default 60s; must be within [30s, 10m].
+	BlackoutRecheck badoption.Duration `json:"blackout_recheck,omitempty"`
+	// Coverage sweep (post-connection): after the proof passes, every
+	// CoverageProbeURLs entry (https, max 64) is fetched THROUGH the verified
+	// tunnel via its own session; percent answered = candidate coverage.
+	// Acceptance keeps candidates within CoverageHysteresis points (0..100,
+	// default 0 = must not be worse) of the best coverage seen so far, and
+	// while the active tunnel is below 100% the outbound keeps prewarming
+	// alternatives until coverage reaches 100% or a full candidate epoch
+	// stops improving (the best candidate is kept). CoverageProbeTimeout
+	// bounds one probe (default 5s, clamp 500ms..60s). With no probe URLs
+	// the whole feature is off and Snapshot reports 0/0.
+	CoverageProbeURLs    []string           `json:"coverage_probe_urls,omitempty"`
+	CoverageProbeTimeout badoption.Duration `json:"coverage_probe_timeout,omitempty"`
+	CoverageHysteresis   int                `json:"coverage_hysteresis,omitempty"`
 }
 
 // HydraOutboundOptions is the configuration for the hydra outbound

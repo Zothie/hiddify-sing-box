@@ -4,59 +4,52 @@ package hydra
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"net"
-	"net/http"
-	"net/netip"
-	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/sagernet/sing-box/common/dialer"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
-	"github.com/sagernet/sing-box/protocol/hydra/adaptive"
 	"github.com/sagernet/sing-box/protocol/hydra/controlclient"
-	M "github.com/sagernet/sing/common/metadata"
+	"github.com/sagernet/sing/common/json/badoption"
 )
 
-// TestExternalControlChain is opt-in: the dedicated tester provisions the Tor
-// daemon (real bootstrap), the onion service serving /catalogue and
-// /catalogue.sig, and the proof origin, then sets:
-//
-//	HYDRA_CHAIN_DAEMON, HYDRA_CHAIN_ONION, HYDRA_CHAIN_ROOT_PUBKEY (hex),
-//	HYDRA_CHAIN_ASN, HYDRA_CHAIN_PROOF, HYDRA_CHAIN_CA, HYDRA_CHAIN_INTERFACE
-//
-// Chain: Tor-only catalogue fetch -> Ed25519 verify -> candidate expansion ->
-// adaptive tunnel per catalogue recipe -> useful-byte proof through the
-// promoted tunnel. There is no direct-net fallback anywhere on this path.
+// TestExternalControlChain uses the production adaptive outbound, including its
+// physical dialer, TLS fronting, negotiation and useful-byte verification.
+// The dedicated tester owns the external server, onion service and proof origin.
 func TestExternalControlChain(t *testing.T) {
 	daemon := os.Getenv("HYDRA_CHAIN_DAEMON")
 	onion := os.Getenv("HYDRA_CHAIN_ONION")
-	offline := os.Getenv("HYDRA_CHAIN_BUNDLED_CATALOGUE") != ""
-	if !offline && (daemon == "" || onion == "") {
+	offline := os.Getenv("HYDRA_CHAIN_BUNDLED_CATALOGUE")
+	if offline == "" && (daemon == "" || onion == "") {
 		t.Skip("external control chain not requested")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	started := time.Now()
+	soak := time.Minute
+	if raw := os.Getenv("HYDRA_CHAIN_SOAK"); raw != "" {
+		var err error
+		soak, err = time.ParseDuration(raw)
+		if err != nil || soak < 0 || soak > 30*time.Minute {
+			t.Fatal("invalid HYDRA_CHAIN_SOAK (0..30m)")
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Minute+soak)
 	defer cancel()
-
 	rootPub, err := hex.DecodeString(os.Getenv("HYDRA_CHAIN_ROOT_PUBKEY"))
 	if err != nil || len(rootPub) != 32 {
 		t.Fatal("invalid root pubkey")
 	}
-	// Offline mode exercises the CONTROL_UNAVAILABLE path: the bundled signed
-	// catalogue is the only allowed source when Tor bootstrap fails. There is
-	// still no unsigned or clearnet fallback anywhere.
 	control := "tor-onion"
 	var catalogueBytes, sig []byte
-	if offline := os.Getenv("HYDRA_CHAIN_BUNDLED_CATALOGUE"); offline != "" {
+	if offline != "" {
 		control = "offline-bundled"
 		catalogueBytes, err = os.ReadFile(offline)
 		if err != nil {
@@ -67,25 +60,36 @@ func TestExternalControlChain(t *testing.T) {
 			t.Fatal(err)
 		}
 	} else {
-		client, err := controlclient.Start(ctx, controlclient.Config{
+		cfg := controlclient.Config{
 			DaemonPath:   daemon,
-			SocksAddr:    "127.0.0.1:19051",
+			SocksAddr:    "127.0.0.1:0",
 			DataDir:      filepath.Join(t.TempDir(), "tor-data"),
 			ControlOnion: onion,
-		})
+		}
+		if bridgeFile := os.Getenv("HYDRA_CHAIN_BRIDGES_FILE"); bridgeFile != "" {
+			ptType := os.Getenv("HYDRA_CHAIN_PT_TYPE")
+			if ptType != "webtunnel" && ptType != "obfs4" {
+				t.Fatal("HYDRA_CHAIN_PT_TYPE must be webtunnel or obfs4")
+			}
+			cfg.ExtraArgs = []string{"--pt-type", ptType, "--bridges-file", bridgeFile, "--pt-path", os.Getenv("HYDRA_CHAIN_PT_PATH")}
+			control = "tor-" + ptType + "-onion"
+		} else if pt := os.Getenv("HYDRA_CHAIN_PT_PATH"); pt != "" {
+			cfg.ExtraArgs = []string{"--bridges", "snowflake", "--pt-path", pt}
+			control = "tor-snowflake-onion"
+		}
+		client, err := controlclient.Start(ctx, cfg)
 		if err != nil {
 			t.Fatal(err)
 		}
 		defer client.Close()
-		deadline := time.Now().Add(3 * time.Minute)
+		bootstrap, stop := context.WithTimeout(ctx, 3*time.Minute)
+		defer stop()
 		for !client.Ready() {
-			if time.Now().After(deadline) {
-				t.Fatal("tor bootstrap deadline exceeded")
-			}
 			select {
+			case <-bootstrap.Done():
+				t.Fatal("tor bootstrap deadline exceeded")
 			case state := <-client.BootstrapStates():
 				t.Logf("bootstrap: %+v", state)
-			case <-time.After(time.Second):
 			}
 		}
 		catalogueBytes, err = client.FetchCatalogue(ctx)
@@ -97,8 +101,7 @@ func TestExternalControlChain(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	// The wire carries the detached signature as hex text (128 chars); the
-	// verifier needs the decoded 64 bytes.
+	controlElapsed := time.Since(started)
 	sigBytes, err := hex.DecodeString(strings.TrimSpace(string(sig)))
 	if err != nil || len(sigBytes) != 64 {
 		t.Fatalf("bad signature encoding: %v", err)
@@ -122,148 +125,134 @@ func TestExternalControlChain(t *testing.T) {
 	if !roots.AppendCertsFromPEM(caPEM) {
 		t.Fatal("invalid proof CA")
 	}
-	proofURL := os.Getenv("HYDRA_CHAIN_PROOF")
-	proof := proofTarget{URL: proofURL, Bytes: 131072, TLS: &tls.Config{RootCAs: roots}}
-	verifyProof := func(ctx context.Context, r adaptive.Resource) error {
-		return verifyTunnelProof(ctx, r.(*Tunnel), proof)
-	}
-	iface := os.Getenv("HYDRA_CHAIN_INTERFACE")
-	physical, physicalErr := newAdaptivePhysicalDialer(ctx, &option.HydraAdaptiveOptions{PhysicalInterface: iface}, option.HydraAdaptiveCandidateOptions{})
-	var physicalPin *dialer.PhysicalDialer
-	if physicalErr == nil {
-		physicalPin, _ = physical.(*dialer.PhysicalDialer)
-	}
-
-	factory, logErr := log.New(log.Options{})
-	if logErr != nil {
-		t.Fatal(logErr)
-	}
-	logger := factory.Logger()
-	recipeByID := make(map[string]CatalogueRecipe)
-	for _, recipe := range cat.Recipes {
-		recipeByID[recipe.ID] = recipe
-	}
-	connect := func(ctx context.Context, candidate adaptive.Candidate) (adaptive.Resource, error) {
-		recipe, ok := recipeByID[candidate.ID]
-		if !ok {
-			return nil, fmt.Errorf("recipe %s vanished", candidate.ID)
-		}
-		serverPub, err := ServerPubkey(cat, candidate.ID)
-		if err != nil {
-			return nil, err
-		}
-		endpoint := firstWssEndpoint(cat, recipe.Server)
-		if endpoint == nil {
-			return nil, fmt.Errorf("recipe %s has no wss endpoint", candidate.ID)
-		}
-		maxFrame, _ := RecipeMaxFrame(cat, candidate.ID)
-		requestURL := &url.URL{Scheme: "ws", Host: endpoint.Host, Path: endpoint.Path}
-		if endpoint.SNI != "" {
-			requestURL.Host = endpoint.SNI
-		}
-		switch recipe.Transport {
-		case "rtc":
-			ip, err := resolveHost(endpoint.Host)
-			if err != nil {
-				return nil, err
-			}
-			addrPort := netip.AddrPortFrom(ip, endpoint.Port)
-			return connectTunnelRTC(ctx, packetDialFrom(ctx, physicalPin, addrPort), serverPub, addrPort, logger, maxFrame)
-		default:
-			return connectTunnelNegotiate(ctx, plainDial(physicalPin, endpoint.Host, endpoint.Port), requestURL, http.Header{}, serverPub, logger, maxFrame)
-		}
-	}
-	candidateIDs := make([]adaptive.Candidate, 0, len(candidates))
-	for i := range candidates {
-		candidateIDs = append(candidateIDs, adaptive.Candidate{ID: candidates[i].ID})
-	}
-	controller, err := adaptive.New(ctx, adaptive.Config{
-		Candidates:     candidateIDs,
-		AttemptTimeout: 15 * time.Second,
-		Backoff:        500 * time.Millisecond,
-		MaxBackoff:     5 * time.Second,
-		Connect:        connect,
-		Verify: func(ctx context.Context, _ adaptive.Candidate, r adaptive.Resource) error {
-			return verifyProof(ctx, r)
-		},
-	})
+	proof := proofTarget{URL: os.Getenv("HYDRA_CHAIN_PROOF"), Bytes: 131072, TLS: &tls.Config{RootCAs: roots}}
+	factory, err := log.New(log.Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer controller.Close()
-	tunnel, err := controller.Acquire(ctx)
+	options := &option.HydraAdaptiveOptions{
+		PhysicalInterface: os.Getenv("HYDRA_CHAIN_INTERFACE"),
+		Candidates:        candidates,
+		ProofURL:          proof.URL,
+		ProofBytes:        proof.Bytes,
+		AttemptTimeout:    badoption.Duration(15 * time.Second),
+		Backoff:           badoption.Duration(time.Second),
+		MaxBackoff:        badoption.Duration(5 * time.Second),
+		StatePath:         os.Getenv("HYDRA_CHAIN_STATE_PATH"),
+		NetworkKey:        os.Getenv("HYDRA_CHAIN_NETWORK_KEY"),
+	}
+	if options.StatePath != "" {
+		if strings.TrimSpace(options.NetworkKey) == "" {
+			t.Fatal("HYDRA_CHAIN_NETWORK_KEY required for persistent state")
+		}
+		options.NetworkKey = fmt.Sprintf("%s:%x:%x", options.NetworkKey, rootPub, sha256.Sum256(catalogueBytes))
+	}
+	if dns := os.Getenv("HYDRA_CHAIN_DNS"); dns != "" {
+		options.PhysicalDNSServers = strings.Split(dns, ",")
+	}
+	built, err := newAdaptiveOutboundWithDependencies(ctx, nil, factory.Logger(), "external-control-chain", option.HydraOutboundOptions{Adaptive: options}, adaptiveOutboundDependencies{ProofTLS: proof.TLS})
+	if err != nil {
+		t.Fatalf("production outbound rejected: %v", err)
+	}
+	o := built.(*Outbound)
+	defer o.Close()
+	proofs := 0
+	var firstReady time.Duration
+	var stableStarted time.Time
+	defer func() {
+		stableFor := time.Duration(0)
+		if !stableStarted.IsZero() {
+			stableFor = time.Since(stableStarted)
+		}
+		report, _ := json.Marshal(map[string]any{
+			"snapshot":   o.adaptiveSnapshot(),
+			"candidates": len(candidates), "skips": skips,
+			"first_verified_ms":     firstReady.Milliseconds(),
+			"control_ms":            controlElapsed.Milliseconds(),
+			"total_elapsed_ms":      time.Since(started).Milliseconds(),
+			"stability_observed_ms": stableFor.Milliseconds(),
+			"useful_proofs":         proofs, "proof_bytes_each": proof.Bytes,
+			"control": control, "onion": onion, "passed": !t.Failed(),
+		})
+		fmt.Println("HYDRA_CONTROL_CHAIN " + string(report))
+	}()
+	searchStarted := time.Now()
+	searchCtx, stopSearch := context.WithTimeout(ctx, 90*time.Second)
+	tunnel, err := o.getTunnel(searchCtx)
+	stopSearch()
 	if err != nil {
 		t.Fatalf("adaptive acquire: %v", err)
 	}
-	if err := verifyProof(ctx, tunnel); err != nil {
+	firstReady = time.Since(searchStarted)
+	if err = verifyTunnelProof(ctx, tunnel, proof); err != nil {
 		t.Fatalf("proof through promoted tunnel: %v", err)
 	}
-	snapshot := controller.Snapshot()
+	proofs++
+	stableStarted = time.Now()
+	deadline := stableStarted.Add(soak)
+	for time.Now().Before(deadline) {
+		delay := 5 * time.Second
+		if remaining := time.Until(deadline); remaining < delay {
+			delay = remaining
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			t.Fatal(ctx.Err())
+		case <-tunnel.Done():
+			timer.Stop()
+			t.Fatal("promoted tunnel died during stability observation")
+		case <-timer.C:
+		}
+		if err = verifyTunnelProof(ctx, tunnel, proof); err != nil {
+			t.Fatalf("stability useful proof: %v", err)
+		}
+		proofs++
+	}
+	if os.Getenv("HYDRA_CHAIN_RECOVERY") == "" {
+		return
+	}
+	// Recovery phase: the operator kills the winning server during this
+	// window; the harness measures death detection -> reacquired verified
+	// tunnel. The coordinator rebuilds through the persisted hint or the
+	// next epoch candidate; the 30 s RecoveryBudget applies to the epoch.
+	fmt.Println("HYDRA_RECOVERY_WINDOW_OPEN", time.Now().UnixMilli())
+	killWindow := 90 * time.Second
+	killDeadline := time.Now().Add(killWindow)
+	diedAt := time.Time{}
+	for time.Now().Before(killDeadline) {
+		if tunnel.IsDead() {
+			diedAt = time.Now()
+			break
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatal(ctx.Err())
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+	if diedAt.IsZero() {
+		t.Fatal("tunnel was not killed within the recovery window")
+	}
+	recoverCtx, stopRecover := context.WithTimeout(ctx, 60*time.Second)
+	recovered, err := o.getTunnel(recoverCtx)
+	stopRecover()
+	if err != nil {
+		t.Fatalf("recovery acquire: %v", err)
+	}
+	recoveryMs := time.Since(diedAt)
+	if err = verifyTunnelProof(ctx, recovered, proof); err != nil {
+		t.Fatalf("recovery proof: %v", err)
+	}
+	proofs++
+	recoveryProofMs := time.Since(diedAt)
 	report, _ := json.Marshal(map[string]any{
-		"active":     snapshot.ActiveID,
-		"attempts":   snapshot.Attempts,
-		"candidates": len(candidates),
-		"skips":      skips,
-		"proof":      "integrity-ok-131072",
-		"control":    control,
-		"onion":      onion,
+		"recovery_ms":       recoveryMs.Milliseconds(),
+		"recovery_proof_ms": recoveryProofMs.Milliseconds(),
+		"within_30s":        recoveryProofMs <= 30*time.Second,
+		"snapshot":          o.adaptiveSnapshot(),
+		"useful_proofs":     proofs,
 	})
-	fmt.Println("HYDRA_CONTROL_CHAIN " + string(report))
-}
-
-// firstWssEndpoint returns the first wss endpoint of a server, nil when none.
-func firstWssEndpoint(cat *Catalogue, serverID string) *CatalogueEndpoint {
-	for i := range cat.Servers {
-		if cat.Servers[i].ID != serverID {
-			continue
-		}
-		for j := range cat.Servers[i].Endpoints {
-			if cat.Servers[i].Endpoints[j].Transport == "wss" {
-				return &cat.Servers[i].Endpoints[j]
-			}
-		}
-	}
-	return nil
-}
-
-// resolveHost accepts literals and falls back to the system resolver; the
-// stand catalogue carries literal IPs.
-func resolveHost(host string) (netip.Addr, error) {
-	if addr, err := netip.ParseAddr(host); err == nil {
-		return addr.Unmap(), nil
-	}
-	ips, err := net.LookupIP(host)
-	if err != nil || len(ips) == 0 {
-		return netip.Addr{}, fmt.Errorf("resolve %s: %w", host, err)
-	}
-	addr, ok := netip.AddrFromSlice(ips[0])
-	if !ok {
-		return netip.Addr{}, fmt.Errorf("resolve %s: unusable address", host)
-	}
-	return addr.Unmap(), nil
-}
-
-// packetDialFrom builds the rtc UDP socket dialer; a nil physical dialer uses
-// the default UDP path. The peer is known at dial time, so the physical
-// dialer can validate and pin the route.
-func packetDialFrom(ctx context.Context, physical *dialer.PhysicalDialer, peer netip.AddrPort) rtcPacketDial {
-	return func(dialCtx context.Context) (net.PacketConn, error) {
-		if physical != nil {
-			return physical.ListenPacket(dialCtx, M.ParseSocksaddr(peer.String()))
-		}
-		var lc net.ListenConfig
-		return lc.ListenPacket(dialCtx, "udp", "0.0.0.0:0")
-	}
-}
-
-// plainDial returns a TCP dial func; a configured physical dialer takes
-// precedence over the default path.
-func plainDial(physical *dialer.PhysicalDialer, host string, port uint16) func(context.Context) (net.Conn, error) {
-	return func(dialCtx context.Context) (net.Conn, error) {
-		if physical != nil {
-			return physical.DialContext(dialCtx, "tcp", M.ParseSocksaddr(net.JoinHostPort(host, fmt.Sprint(port))))
-		}
-		var d net.Dialer
-		return d.DialContext(dialCtx, "tcp", net.JoinHostPort(host, fmt.Sprint(port)))
-	}
+	fmt.Println("HYDRA_RECOVERY " + string(report))
 }

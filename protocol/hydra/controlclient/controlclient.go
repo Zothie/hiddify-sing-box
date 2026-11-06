@@ -40,6 +40,7 @@ const (
 
 	defaultControlPort = 80
 	bootstrapChanCap   = 32
+	maxControlBody     = 256 * 1024
 )
 
 // Config for Start.
@@ -164,9 +165,11 @@ func (c *Client) FetchCatalogue(ctx context.Context) ([]byte, error) {
 	return c.FetchPath(ctx, "/catalogue")
 }
 
-// FetchPath fetches an arbitrary path on the control onion through the
-// daemon's Tor-only SOCKS; there is no direct-net fallback on this path.
+// FetchPath fetches the catalogue or its detached signature through Tor only.
 func (c *Client) FetchPath(ctx context.Context, path string) ([]byte, error) {
+	if path != "/catalogue" && path != "/catalogue.sig" {
+		return nil, errors.New("controlclient: unsupported control path")
+	}
 	c.mu.Lock()
 	cmd := c.cmd
 	alive := cmd != nil && c.alive.Load()
@@ -307,13 +310,18 @@ func (c *Client) readStderr(r io.Reader) {
 		if !strings.HasPrefix(line, "BOOTSTRAP ") {
 			continue
 		}
-		st := BootstrapState{
-			Ready: strings.Contains(line, "ready=true"),
-			Text:  line,
+		ready, _ := extractField(line, "ready=")
+		addr, announced := extractField(line, "socks=")
+		listenerReady := false
+		if ready == "true" && announced && requireLoopback(addr) == nil {
+			_, port, err := net.SplitHostPort(addr)
+			_, portErr := parsePort(port)
+			listenerReady = err == nil && portErr == nil
 		}
+		st := BootstrapState{Ready: listenerReady, Text: line}
 		c.mu.Lock()
 		c.ready = st.Ready
-		if addr, ok := extractField(line, "socks="); ok {
+		if listenerReady {
 			c.annAddr = addr
 		}
 		c.mu.Unlock()
@@ -394,6 +402,8 @@ func socksDial(ctx context.Context, socksAddr, host string, port int) (net.Conn,
 	if err != nil {
 		return nil, err
 	}
+	stopCancel := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stopCancel()
 	if dl, ok := ctx.Deadline(); ok {
 		_ = conn.SetDeadline(dl)
 	} else {
@@ -470,6 +480,8 @@ func httpGetCatalogue(ctx context.Context, conn net.Conn, host string) ([]byte, 
 
 // httpGetPath speaks plain HTTP/1.0 for one path over the SOCKS stream.
 func httpGetPath(ctx context.Context, conn net.Conn, host, path string) ([]byte, error) {
+	stopCancel := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stopCancel()
 	if dl, ok := ctx.Deadline(); ok {
 		_ = conn.SetDeadline(dl)
 	}
@@ -482,12 +494,22 @@ func httpGetPath(ctx context.Context, conn net.Conn, host, path string) ([]byte,
 		return nil, fmt.Errorf("catalogue response: %w", err)
 	}
 	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("catalogue fetch: unexpected status %d", resp.StatusCode)
+	}
+	limit := maxControlBody
+	if path == "/catalogue.sig" {
+		limit = 1024
+	}
+	if resp.ContentLength > int64(limit) {
+		return nil, errors.New("controlclient: response exceeds size limit")
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, int64(limit)+1))
 	if err != nil {
 		return nil, fmt.Errorf("catalogue body: %w", err)
 	}
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("catalogue fetch: unexpected status %d", resp.StatusCode)
+	if len(body) > limit {
+		return nil, errors.New("controlclient: response exceeds size limit")
 	}
 	return body, nil
 }

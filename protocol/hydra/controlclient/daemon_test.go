@@ -9,6 +9,8 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -208,6 +210,65 @@ func TestNoFallbackWhenDaemonClosed(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "daemon not running") {
 		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+// Real daemon forwarding to a real HTTP origin, not a synthetic SOCKS peer.
+func TestControlFetchBoundsAndCancellation(t *testing.T) {
+	daemon := buildDaemon(t)
+	requests := make(chan string, 4)
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests <- r.URL.Path
+		if r.URL.Path == "/catalogue" {
+			w.Header().Set("Content-Length", "262145")
+			_, _ = w.Write(bytes.Repeat([]byte{'x'}, 262145))
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		w.(http.Flusher).Flush()
+		<-r.Context().Done()
+	}))
+	defer origin.Close()
+	c, err := Start(context.Background(), Config{
+		DaemonPath: daemon, SocksAddr: "127.0.0.1:0", DataDir: t.TempDir(),
+		ControlOnion: "hydracontroltest.onion",
+		ExtraArgs:    []string{"--mock-tor", strings.TrimPrefix(origin.URL, "http://")},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	waitReady(t, c, 15*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err = c.FetchPath(ctx, "/unexpected"); err == nil {
+		t.Fatal("control client sent an unsupported request path")
+	}
+	if _, err = c.FetchCatalogue(ctx); err == nil {
+		t.Fatal("control client accepted oversized catalogue")
+	}
+	if got := <-requests; got != "/catalogue" {
+		t.Fatalf("unexpected request reached origin: %s", got)
+	}
+	fetchCtx, stop := context.WithCancel(ctx)
+	done := make(chan error, 1)
+	go func() { _, err := c.FetchPath(fetchCtx, "/catalogue.sig"); done <- err }()
+	select {
+	case got := <-requests:
+		if got != "/catalogue.sig" {
+			t.Fatalf("unexpected signature request: %s", got)
+		}
+	case <-ctx.Done():
+		t.Fatal("signature request did not reach origin")
+	}
+	stop()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("cancelled fetch succeeded")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("cancellation failed to interrupt control response read")
 	}
 }
 

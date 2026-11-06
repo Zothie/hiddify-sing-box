@@ -7,14 +7,16 @@ package hydra
 // Design: stream bytes are cut into <=Chunk bodies; every body is sealed by
 // the mask layer (the caller) at a per-kind counter base and sent as an
 // SRTP-shaped packet. ACKs ride RTCP-RR-shaped packets (cumulative + 32-bit
-// SACK bitmap); losses are repaired first by XOR parity (one repair packet per
-// FecGroup data packets, ULPFEC-shaped PT) and finally by RTO retransmit of
-// the original sealed body.
+// SACK bitmap); losses use RTO retransmission of the original sealed body.
+// Legacy XOR parity is disabled: it omits shard lengths and can inject zeros
+// into variable-length ciphertext streams. Reserved wire counters stay intact.
 //
 // The core is synchronous and unit-testable; the RtcMask engine (rtc.go) owns
 // the wire glue.
 
-import "time"
+import (
+	"time"
+)
 
 // Stream bytes per data packet (wire: 12 RTP + 4 seq + Chunk + 16 tag <= 1190).
 const Chunk = 1150
@@ -22,8 +24,8 @@ const Chunk = 1150
 // Window is the max unacked data packets in flight (backpressure window).
 const Window = 128
 
-// FecGroup is the XOR parity group size: one repair packet per this many data
-// packets.
+// FecGroup is the historical group size, retained for compatibility and
+// regression diagnostics only. Legacy FEC is unsupported.
 const FecGroup = 32 / 8
 
 // RTO bounds (retransmission timeout, milliseconds) ported from reliable.rs.
@@ -36,11 +38,8 @@ const (
 // stream seq 0 is reserved for parity).
 const ParitySeq uint32 = 0
 
-// Per-direction out-of-order buffer cap and retained FEC groups cap.
-const (
-	bufferCap    = 512
-	fecGroupsCap = 64
-)
+// Per-direction out-of-order buffer cap.
+const bufferCap = 512
 
 // Counter-space separation between data / parity / ack / keepalive packets so
 // a single ChaCha cipher can serve all four without nonce reuse.
@@ -69,33 +68,26 @@ type inFlight struct {
 	retransmits int
 }
 
-// OutChannel is the sending side: chunking, windowing, RTO retransmit, XOR
-// parity emission.
+// OutChannel is the sending side: chunking, windowing and RTO retransmission.
 type OutChannel struct {
-	seal          MaskSeal
-	nextSeq       uint32
-	ackCounter    uint64 // reserved ack-seq space (kept for observability)
-	parityCounter uint64
-	unacked       []inFlight
-	groupXor      []byte
-	groupLen      int
-	srtt          float64
-	hasSrtt       bool
-	rto           float64 // milliseconds
+	seal    MaskSeal
+	nextSeq uint32
+	unacked []inFlight
+	srtt    float64
+	hasSrtt bool
+	rto     float64 // milliseconds
 }
 
 func newOutChannel(seal MaskSeal) *OutChannel {
 	return &OutChannel{
-		seal:          seal,
-		nextSeq:       1,
-		ackCounter:    ackCounterBase + 1,
-		parityCounter: parityCounterBase + 1,
-		rto:           500.0,
+		seal:    seal,
+		nextSeq: 1,
+		rto:     500.0,
 	}
 }
 
 // trySend queues one stream chunk and returns the packets to put on the wire
-// — the data packet and, on a FEC group boundary, the parity packet — or an
+// — one data packet, without unsafe legacy parity — or an
 // empty slice when the window is full (the caller retries after acks arrive).
 func (o *OutChannel) trySend(chunk []byte, now time.Time) []reliablePacket {
 	if len(o.unacked) >= Window {
@@ -118,27 +110,9 @@ func (o *OutChannel) trySend(chunk []byte, now time.Time) []reliablePacket {
 	out := make([]reliablePacket, 0, 2)
 	out = append(out, reliablePacket{Counter: counter, Body: sealed})
 
-	// Fold into the FEC group; when the group is full, parity follows.
-	if len(o.groupXor) < len(body) {
-		o.groupXor = append(o.groupXor, make([]byte, len(body)-len(o.groupXor))...)
-	}
-	for i, b := range body {
-		o.groupXor[i] ^= b
-	}
-	o.groupLen++
-	if o.groupLen == FecGroup {
-		parity := make([]byte, 12, 12+len(o.groupXor))
-		binaryBigEndianPutUint32(parity, ParitySeq)
-		binaryBigEndianPutUint32(parity[4:], seq+1-FecGroup) // group base
-		binaryBigEndianPutUint32(parity[8:], FecGroup)
-		parity = append(parity, o.groupXor...)
-		counter := o.parityCounter
-		o.parityCounter++
-		sealed := o.seal(counter, parity)
-		o.groupXor = o.groupXor[:0]
-		o.groupLen = 0
-		out = append(out, reliablePacket{Counter: counter, Body: sealed})
-	}
+	// Legacy XOR parity carries no original shard lengths. A peer can
+	// reconstruct a short shard with a zero tail and corrupt its frame
+	// stream. Do not send it; authenticated originals remain retransmittable.
 	return out
 }
 
@@ -213,20 +187,11 @@ func (o *OutChannel) windowFree() bool {
 	return len(o.unacked) < Window
 }
 
-type fecGroup struct {
-	size   uint32
-	xor    []byte
-	hasXor bool
-	// present bare chunks keyed by stream seq
-	bodies map[uint32][]byte
-}
-
 // InChannel is the receiving side: in-order delivery, out-of-order buffering,
-// XOR repair, ACK bookkeeping.
+// ACK bookkeeping. Only original data packets can advance the stream.
 type InChannel struct {
 	expected uint32
 	recv     map[uint32][]byte
-	fec      map[uint32]*fecGroup
 	ready    [][]byte
 	ackDirty bool
 }
@@ -235,7 +200,6 @@ func newInChannel() *InChannel {
 	return &InChannel{
 		expected: 1,
 		recv:     make(map[uint32][]byte),
-		fec:      make(map[uint32]*fecGroup),
 	}
 }
 
@@ -252,94 +216,7 @@ func (in *InChannel) onDataBody(body []byte) bool {
 	}
 	in.recv[seq] = append([]byte{}, chunk...)
 	in.ackDirty = true
-	// FEC bookkeeping (groups: 1..=4, 5..=8, ... base = ((seq-1)/4)*4+1)
-	base := ((seq-1)/FecGroup)*FecGroup + 1
-	entry := in.fec[base]
-	if entry == nil {
-		entry = &fecGroup{size: FecGroup, bodies: make(map[uint32][]byte)}
-		in.fec[base] = entry
-	}
-	entry.bodies[seq] = append([]byte{}, chunk...)
-	in.tryRepair(base)
-	in.evictFecIfNeeded()
 	return in.deliverReady()
-}
-
-// onParityBody feeds a parity body [u32 0][u32 groupBase][u32 groupSize][xor].
-func (in *InChannel) onParityBody(body []byte) bool {
-	if len(body) < 12 {
-		return false
-	}
-	base := uint32FromBE(body[4:8])
-	size := uint32FromBE(body[8:12])
-	if base == 0 || size == 0 || size > 64 {
-		return false
-	}
-	entry := in.fec[base]
-	if entry == nil {
-		entry = &fecGroup{bodies: make(map[uint32][]byte)}
-		in.fec[base] = entry
-	}
-	entry.size = size
-	entry.xor = append([]byte{}, body[12:]...)
-	entry.hasXor = true
-	in.tryRepair(base)
-	in.evictFecIfNeeded()
-	return in.deliverReady()
-}
-
-// tryRepair reconstructs the missing body when xor + (size-1) bodies are
-// present (single loss per group).
-func (in *InChannel) tryRepair(base uint32) {
-	g := in.fec[base]
-	if g == nil || !g.hasXor {
-		return
-	}
-	var missing []uint32
-	for i := uint32(0); i < g.size; i++ {
-		seq := base + i
-		_, present := g.bodies[seq]
-		if !present && seq < in.expected {
-			// already delivered: not missing
-		} else if !present {
-			missing = append(missing, seq)
-		}
-	}
-	if len(missing) != 1 {
-		return
-	}
-	seq := missing[0]
-	recovered := append([]byte{}, g.xor...)
-	// parity accumulated over FULL bodies ([u32 seq][chunk]); the stored
-	// present bodies are bare chunks — XOR them back at the 4-byte offset so
-	// the layout aligns.
-	for _, b := range g.bodies {
-		if len(recovered) < 4+len(b) {
-			recovered = append(recovered, make([]byte, 4+len(b)-len(recovered))...)
-		}
-		for i, byteVal := range b {
-			recovered[4+i] ^= byteVal
-		}
-	}
-	if len(recovered) >= 4 {
-		chunk := append([]byte{}, recovered[4:]...)
-		g.bodies[seq] = chunk
-		in.recv[seq] = append([]byte{}, chunk...)
-	}
-}
-
-func (in *InChannel) evictFecIfNeeded() {
-	for len(in.fec) > fecGroupsCap {
-		oldest := uint32(0)
-		first := true
-		for k := range in.fec {
-			if first || k < oldest {
-				oldest = k
-				first = false
-			}
-		}
-		delete(in.fec, oldest)
-	}
 }
 
 // deliverReady moves contiguous bodies from recv into ready.

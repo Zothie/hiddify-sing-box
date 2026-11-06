@@ -189,7 +189,7 @@ func mustBeBytes8(counter uint64) []byte {
 func deliverReliable(rx *InChannel, counter uint64, sealed []byte) bool {
 	body := testOpen(counter, sealed)
 	if len(body) >= 4 && binary.BigEndian.Uint32(body[:4]) == ParitySeq {
-		return rx.onParityBody(body)
+		return false // Legacy parity lacks shard lengths; only ARQ is supported.
 	}
 	return rx.onDataBody(body)
 }
@@ -524,7 +524,8 @@ func TestReliableOutOfOrderAndDuplicates(t *testing.T) {
 	}
 }
 
-func TestReliableLossRecoveredByXorParity(t *testing.T) {
+// Legacy parity cannot safely recover variable-length shards; require ARQ.
+func TestReliableSingleLossRecoveredByRTO(t *testing.T) {
 	tx := newOutChannel(testSeal)
 	rx := newInChannel()
 	now := time.Unix(0, 0)
@@ -540,8 +541,17 @@ func TestReliableLossRecoveredByXorParity(t *testing.T) {
 		deliverReliable(rx, p.Counter, p.Body)
 	}
 	chunks := rx.takeReady()
+	if len(chunks) != 1 {
+		t.Fatalf("only seq 1 can arrive before retransmission; got %d", len(chunks))
+	}
+	upto, bm, _ := rx.takeAck()
+	tx.onAck(upto, bm, now)
+	for _, p := range tx.pollRetransmit(now.Add(600 * time.Millisecond)) {
+		deliverReliable(rx, p.Counter, p.Body)
+	}
+	chunks = append(chunks, rx.takeReady()...)
 	if len(chunks) != 4 {
-		t.Fatalf("single loss per group must be FEC-repaired; got %d", len(chunks))
+		t.Fatalf("ARQ must release all four chunks; got %d", len(chunks))
 	}
 	for i, c := range chunks {
 		if !bytes.Equal(c, chunkOf(i, 200)) {
@@ -1069,10 +1079,9 @@ func TestEngineHandshakeSimAndFrames(t *testing.T) {
 	}
 }
 
-// TestEngineSingleLossFECRecovery drops the first c2s data datagram of a
-// 5000-byte frame (5 chunks -> one FEC parity packet) and requires the server
-// to repair it from parity with the stream intact.
-func TestEngineSingleLossFECRecovery(t *testing.T) {
+// TestEngineSingleLossRTORecovery replaces unsafe legacy FEC expectations.
+// A lost original must be retransmitted without emitting ambiguous parity.
+func TestEngineSingleLossRTORecovery(t *testing.T) {
 	s := newSim(t)
 	s.runUntilConnected(t, 200)
 	s.drainFlight()
@@ -1082,15 +1091,15 @@ func TestEngineSingleLossFECRecovery(t *testing.T) {
 	}
 	s.client.SendFrame(big)
 	pc := s.client.Poll(s.now) // emit the data datagrams
-	// parity packet must exist: 5 chunks -> exactly one PT-100 datagram
+	// Legacy parity is unsupported because it omits original shard lengths.
 	parityCount := 0
 	for _, dg := range pc.Wire {
 		if len(dg) >= 2 && dg[1]&0x7f == RTPPtFec {
 			parityCount++
 		}
 	}
-	if parityCount != 1 {
-		t.Fatalf("expected exactly 1 parity datagram, got %d", parityCount)
+	if parityCount != 0 {
+		t.Fatalf("unsafe legacy parity emitted: %d", parityCount)
 	}
 	for i, dg := range pc.Wire {
 		if i == 0 {
@@ -1105,10 +1114,10 @@ func TestEngineSingleLossFECRecovery(t *testing.T) {
 		}
 	}
 	if len(s.serverFrames) == 0 {
-		t.Fatal("FEC must repair a single loss")
+		t.Fatal("RTO must repair a single loss")
 	}
 	if !bytes.Equal(s.serverFrames[0], big) {
-		t.Fatal("FEC-repaired frame must be byte-exact")
+		t.Fatal("RTO-repaired frame must be byte-exact")
 	}
 }
 

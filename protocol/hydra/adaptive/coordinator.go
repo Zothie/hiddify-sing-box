@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/rand/v2"
 	"reflect"
 	"sync"
 	"time"
@@ -20,13 +21,27 @@ type Resource interface {
 }
 
 type Config struct {
-	Candidates     []Candidate
-	LastGood       string
+	Candidates []Candidate
+	LastGood   string
+	// StateKey scopes validated policy/config and network. Recreate this
+	// coordinator on identity changes; ResetNetwork removes the old hint.
+	StatePath      string
+	StateKey       string
 	AttemptTimeout time.Duration
 	Backoff        time.Duration
 	MaxBackoff     time.Duration
-	Connect        func(context.Context, Candidate) (Resource, error)
-	Verify         func(context.Context, Candidate, Resource) error
+	// BlackoutRecheck is the wait between blackout reference rechecks. Zero
+	// uses BlackoutRecheckDefault; other values clamp into
+	// [BlackoutRecheckMin, BlackoutRecheckMax]. One recheck is one bounded
+	// probe, never a candidate sweep.
+	BlackoutRecheck time.Duration
+	Connect         func(context.Context, Candidate) (Resource, error)
+	Verify          func(context.Context, Candidate, Resource) error
+	// Recheck performs one bounded reachability probe while blackout is
+	// active. Returning true clears blackout and resumes the candidate
+	// sweep. Nil leaves blackout in place until SetBlackout(false) arrives
+	// from outside.
+	Recheck func(context.Context) bool
 	// Jitter must return promptly. Its output is clamped to [Backoff, MaxBackoff].
 	Jitter func(time.Duration) time.Duration
 	// Wait must return on cancellation. Nil uses a context-aware timer.
@@ -35,14 +50,55 @@ type Config struct {
 }
 
 type Snapshot struct {
-	Generation uint64
-	ActiveID   string
-	LastGood   string
-	Attempts   uint64
-	Closed     bool
+	Generation            uint64
+	ActiveID              string
+	LastGood              string
+	Attempts              uint64
+	Closed                bool
+	UniqueCandidatesTried uint64
+	TotalAttempts         uint64        // Computed alias of Attempts.
+	SearchElapsed         time.Duration // Cumulative active search, excluding healthy uptime.
+	LastSearchElapsed     time.Duration // Most recently completed search interval.
+	SearchInProgress      bool
+	StateLoaded           bool
+	StateSaved            bool
+	StateError            string
+	Blackout              bool   // Reference probes say the physical internet is dead.
+	BlackoutReason        string // Why blackout was entered; empty when clear.
+	CoveragePercent       int    // Measured percent of coverage probe URLs answered by the active tunnel; 0 = no coverage probing or nothing measured yet.
+	CoverageTarget        int    // Best coverage observed so far — the bar a replacement candidate must match within hysteresis.
 }
 
 var ErrClosed = errors.New("adaptive coordinator closed")
+
+// Blackout recheck doctrine: slow by default and clamped, so a blackout can
+// never turn into a burst of probes.
+const (
+	BlackoutRecheckDefault = 60 * time.Second
+	BlackoutRecheckMin     = 30 * time.Second
+	BlackoutRecheckMax     = 10 * time.Minute
+)
+
+func clampBlackoutRecheck(d time.Duration) time.Duration {
+	if d <= 0 {
+		return BlackoutRecheckDefault
+	}
+	if d < BlackoutRecheckMin {
+		return BlackoutRecheckMin
+	}
+	if d > BlackoutRecheckMax {
+		return BlackoutRecheckMax
+	}
+	return d
+}
+
+// jittered widens a wait so concurrent clients never recheck in sync.
+func jittered(d time.Duration) time.Duration {
+	if d <= 0 {
+		return d
+	}
+	return d + time.Duration(rand.Int64N(max(int64(d)/8, 1)))*time.Nanosecond
+}
 
 // maxTrackedFailures caps the failure score so a long-dead candidate is only
 // demoted, never permanently exiled from the fair rotation.
@@ -110,26 +166,34 @@ func isNilResource(r Resource) bool {
 }
 
 type Coordinator struct {
-	mu               sync.Mutex
-	cfg              Config
-	ctx              context.Context
-	cancel           context.CancelFunc
-	generation       context.Context
-	cancelGeneration context.CancelFunc
-	state            Snapshot
-	active           Resource
-	changed          chan struct{}
-	wake             chan struct{}
-	next             int
-	preferred        bool
-	degraded         bool
-	lastPrewarm      time.Time
-	stats            map[string]*candStat
+	mu                 sync.Mutex
+	cfg                Config
+	ctx                context.Context
+	cancel             context.CancelFunc
+	generation         context.Context
+	cancelGeneration   context.CancelFunc
+	state              Snapshot
+	active             Resource
+	changed            chan struct{}
+	wake               chan struct{}
+	next               int
+	preferred          bool
+	degraded           bool
+	lastPrewarm        time.Time
+	stats              map[string]*candStat
+	searchStarted      time.Time
+	persistenceEnabled bool
+	// blackoutCancel breaks the in-flight wait when blackout flips, so the
+	// loop re-evaluates promptly instead of finishing the old interval.
+	blackoutCancel context.CancelFunc
 }
 
 func New(parent context.Context, cfg Config) (*Coordinator, error) {
 	if parent == nil || len(cfg.Candidates) == 0 || cfg.Connect == nil || cfg.Verify == nil || cfg.AttemptTimeout <= 0 || cfg.Backoff <= 0 || cfg.MaxBackoff < cfg.Backoff {
 		return nil, errors.New("invalid adaptive configuration")
+	}
+	if (cfg.StatePath == "") != (cfg.StateKey == "") {
+		return nil, errors.New("state path and key must be supplied together")
 	}
 	seen := make(map[string]bool)
 	for _, v := range cfg.Candidates {
@@ -141,6 +205,7 @@ func New(parent context.Context, cfg Config) (*Coordinator, error) {
 	if cfg.LastGood != "" && !seen[cfg.LastGood] {
 		return nil, errors.New("unknown last-good candidate")
 	}
+	cfg.BlackoutRecheck = clampBlackoutRecheck(cfg.BlackoutRecheck)
 	cfg.Candidates = append([]Candidate(nil), cfg.Candidates...)
 	if cfg.Wait == nil {
 		cfg.Wait = func(ctx context.Context, d time.Duration) error {
@@ -156,7 +221,8 @@ func New(parent context.Context, cfg Config) (*Coordinator, error) {
 	}
 	ctx, cancel := context.WithCancel(parent)
 	g, gcancel := context.WithCancel(ctx)
-	c := &Coordinator{cfg: cfg, ctx: ctx, cancel: cancel, generation: g, cancelGeneration: gcancel, changed: make(chan struct{}), wake: make(chan struct{}, 1), preferred: true, stats: make(map[string]*candStat), state: Snapshot{Generation: 1, LastGood: cfg.LastGood}}
+	c := &Coordinator{persistenceEnabled: true, cfg: cfg, ctx: ctx, cancel: cancel, generation: g, cancelGeneration: gcancel, changed: make(chan struct{}), wake: make(chan struct{}, 1), preferred: true, stats: make(map[string]*candStat), state: Snapshot{Generation: 1, LastGood: cfg.LastGood}}
+	c.loadHint()
 	context.AfterFunc(ctx, func() { c.Close() })
 	go c.run()
 	return c, nil
@@ -197,7 +263,50 @@ func (c *Coordinator) Acquire(ctx context.Context) (Resource, error) {
 		}
 	}
 }
-func (c *Coordinator) Snapshot() Snapshot { c.mu.Lock(); defer c.mu.Unlock(); return c.state }
+func (c *Coordinator) Snapshot() Snapshot {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	s := c.state
+	s.TotalAttempts = s.Attempts
+	if s.SearchInProgress {
+		s.SearchElapsed += time.Since(c.searchStarted)
+	}
+	return s
+}
+
+// All metric and promotion helpers require mu.
+func (c *Coordinator) beginSearch() {
+	if !c.state.SearchInProgress {
+		c.searchStarted = time.Now()
+		c.state.SearchInProgress = true
+	}
+}
+func (c *Coordinator) endSearch() {
+	if c.state.SearchInProgress {
+		c.state.LastSearchElapsed = time.Since(c.searchStarted)
+		c.state.SearchElapsed += c.state.LastSearchElapsed
+		c.state.SearchInProgress = false
+	}
+}
+func (c *Coordinator) countAttempt(id string) {
+	c.beginSearch()
+	if c.stat(id).attempts == 0 {
+		c.state.UniqueCandidatesTried++
+	}
+	c.state.Attempts++
+	c.stat(id).attempts++
+}
+func (c *Coordinator) promote(r Resource, id string) {
+	c.active = r
+	c.state.ActiveID = id
+	c.state.LastGood = id
+	// A verified tunnel is live proof the internet is not fully dead.
+	c.state.Blackout = false
+	c.state.BlackoutReason = ""
+	c.endSearch()
+	c.saveHint()
+	c.signal()
+}
 
 // ReportDegraded asks for a make-before-break alternative: while a healthy
 // resource serves traffic, the next eligible candidate is built and verified
@@ -216,12 +325,47 @@ func (c *Coordinator) ReportDegraded() {
 	default:
 	}
 }
+
+// SetBlackout tells the coordinator whether the physical internet is
+// reachable, as proven by the caller's reference probes. With blackout on,
+// candidate attempts stop entirely; the loop then waits BlackoutRecheck with
+// jitter and runs one bounded recheck per interval. Repeated identical calls
+// only refresh the reason.
+func (c *Coordinator) SetBlackout(on bool, reason string) {
+	c.mu.Lock()
+	if c.state.Closed || c.ctx.Err() != nil {
+		c.mu.Unlock()
+		return
+	}
+	if c.state.Blackout == on {
+		if on {
+			c.state.BlackoutReason = reason
+		}
+		c.mu.Unlock()
+		return
+	}
+	c.state.Blackout = on
+	if on {
+		c.state.BlackoutReason = reason
+		c.endSearch()
+	} else {
+		c.state.BlackoutReason = ""
+	}
+	cancel := c.blackoutCancel
+	c.mu.Unlock()
+	if cancel != nil {
+		// Break any in-flight wait so the loop re-evaluates promptly.
+		cancel()
+	}
+}
+
 func (c *Coordinator) Close() error {
 	c.mu.Lock()
 	if c.state.Closed {
 		c.mu.Unlock()
 		return nil
 	}
+	c.endSearch()
 	c.state.Closed = true
 	c.state.Generation++
 	c.cancel()
@@ -245,6 +389,19 @@ func (c *Coordinator) ResetNetwork() {
 		return
 	}
 	c.cancelGeneration()
+	c.preferred = false
+	c.degraded = false
+	// A new physical network is unknown: let the sweep try again immediately.
+	c.state.Blackout = false
+	c.state.BlackoutReason = ""
+	breakoutCancel := c.blackoutCancel
+	c.blackoutCancel = nil
+	c.state.LastGood = ""
+	c.state.StateLoaded = false
+	c.persistenceEnabled = false
+	c.clearHint()
+	c.stateError(errors.New("network changed; recreate coordinator with current network key to persist"))
+	c.beginSearch()
 	c.generation, c.cancelGeneration = context.WithCancel(c.ctx)
 	c.state.Generation++
 	r := c.active
@@ -252,6 +409,9 @@ func (c *Coordinator) ResetNetwork() {
 	c.state.ActiveID = ""
 	c.signal()
 	c.mu.Unlock()
+	if breakoutCancel != nil {
+		breakoutCancel()
+	}
 	if r != nil {
 		_ = r.Close()
 	}
@@ -263,8 +423,7 @@ func (c *Coordinator) ResetNetwork() {
 
 // prewarm builds and verifies one alternative candidate while current keeps
 // serving. It consumes the next fair slot (skipping the current ID) and never
-// touches the active resource or the snapshot. Best effort: any failure is a
-// miss, not an error surfaced to callers.
+// replaces the active resource itself. Attempts contribute to lifetime metrics.
 func (c *Coordinator) prewarm(generation context.Context, current Resource) (Resource, string, bool) {
 	c.mu.Lock()
 	var candidate Candidate
@@ -276,11 +435,27 @@ func (c *Coordinator) prewarm(generation context.Context, current Resource) (Res
 			break
 		}
 	}
-	if c.state.Closed || generation.Err() != nil || isNilResource(current) && false {
+	if c.state.Closed || generation.Err() != nil || isNilResource(current) || c.active != current || candidate.ID == "" {
 		c.mu.Unlock()
 		return nil, "", false
 	}
+	c.countAttempt(candidate.ID)
 	c.mu.Unlock()
+	succeeded := false
+	defer func() {
+		c.mu.Lock()
+		if c.generation == generation {
+			if succeeded {
+				c.stat(candidate.ID).failures = 0
+			} else {
+				if c.stat(candidate.ID).failures < maxTrackedFailures {
+					c.stat(candidate.ID).failures++
+				}
+				c.endSearch()
+			}
+		}
+		c.mu.Unlock()
+	}()
 	ctx, cancel := context.WithTimeout(generation, c.cfg.AttemptTimeout)
 	defer cancel()
 	alt, err := c.attempt(ctx, candidate)
@@ -289,9 +464,11 @@ func (c *Coordinator) prewarm(generation context.Context, current Resource) (Res
 	}
 	select {
 	case <-alt.Done():
+		_ = alt.Close()
 		return nil, "", false
 	default:
 	}
+	succeeded = true
 	return alt, candidate.ID, true
 }
 
@@ -380,6 +557,44 @@ func (c *Coordinator) run() {
 		}
 		g := c.generation
 		gen := c.state.Generation
+		// Blackout: candidate attempts stop entirely. The loop waits
+		// BlackoutRecheck with jitter, then runs ONE bounded reference
+		// recheck; candidates resume only after a recheck succeeds.
+		if c.state.Blackout {
+			c.endSearch()
+			recheck := c.cfg.BlackoutRecheck
+			c.mu.Unlock()
+			waitCtx, cancel := context.WithCancel(g)
+			c.mu.Lock()
+			c.blackoutCancel = cancel
+			c.mu.Unlock()
+			waitErr := c.cfg.Wait(waitCtx, jittered(recheck))
+			c.mu.Lock()
+			c.blackoutCancel = nil
+			closed := c.state.Closed || c.ctx.Err() != nil
+			blackout := c.state.Blackout
+			c.mu.Unlock()
+			waitCanceled := waitCtx.Err() != nil
+			cancel()
+			if closed {
+				return
+			}
+			if g.Err() != nil {
+				epoch = 0
+				delay = c.cfg.Backoff
+				continue
+			}
+			if waitErr != nil && !waitCanceled {
+				_ = c.Close()
+				return
+			}
+			if blackout && c.cfg.Recheck != nil && c.cfg.Recheck(g) {
+				c.SetBlackout(false, "")
+				epoch = 0
+				delay = c.cfg.Backoff
+			}
+			continue
+		}
 		v := c.cfg.Candidates[c.next]
 		if c.preferred && c.state.LastGood != "" {
 			for index, candidate := range c.cfg.Candidates {
@@ -402,14 +617,13 @@ func (c *Coordinator) run() {
 			}
 			c.preferred = false
 		}
-		c.state.Attempts++
-		c.stat(v.ID).attempts++
+		c.countAttempt(v.ID)
 		c.mu.Unlock()
 		ctx, cancel := context.WithTimeout(g, c.cfg.AttemptTimeout)
 		r, err := c.attempt(ctx, v)
 		cancel()
 		c.mu.Lock()
-		stale := c.state.Closed || gen != c.state.Generation || g.Err() != nil
+		stale := c.state.Closed || c.ctx.Err() != nil || gen != c.state.Generation || g.Err() != nil
 		if !stale {
 			if err == nil {
 				c.stat(v.ID).failures = 0
@@ -425,10 +639,7 @@ func (c *Coordinator) run() {
 			}
 		}
 		if !stale && err == nil {
-			c.active = r
-			c.state.ActiveID = v.ID
-			c.state.LastGood = v.ID
-			c.signal()
+			c.promote(r, v.ID)
 			c.mu.Unlock()
 			delay = c.cfg.Backoff
 			epoch = 0
@@ -444,17 +655,30 @@ func (c *Coordinator) run() {
 				c.mu.Lock()
 				degraded := c.degraded
 				c.degraded = false
+				blackout := c.state.Blackout
 				c.mu.Unlock()
 				// Make-before-break: build and verify one alternative while the
 				// healthy resource keeps serving. Rate-limited by Backoff.
-				if degraded && c.ctx.Err() == nil && time.Since(c.lastPrewarm) >= c.cfg.Backoff {
+				// Blackout stops candidate attempts, prewarms included.
+				if degraded && !blackout && c.ctx.Err() == nil && time.Since(c.lastPrewarm) >= c.cfg.Backoff {
 					c.lastPrewarm = time.Now()
 					if alt, altID, ok := c.prewarm(g, r); ok {
 						c.mu.Lock()
-						c.active = alt
-						c.state.ActiveID = altID
-						c.state.LastGood = altID
-						c.signal()
+						dead := false
+						select {
+						case <-alt.Done():
+							dead = true
+						default:
+						}
+						if c.state.Closed || c.ctx.Err() != nil || g.Err() != nil || gen != c.state.Generation || c.active != r || dead {
+							if gen == c.state.Generation {
+								c.endSearch()
+							}
+							c.mu.Unlock()
+							_ = alt.Close()
+							continue
+						}
+						c.promote(alt, altID)
 						c.mu.Unlock()
 						_ = r.Close()
 						delay = c.cfg.Backoff
@@ -467,6 +691,7 @@ func (c *Coordinator) run() {
 			if c.state.Generation == gen && c.active != nil {
 				c.active = nil
 				c.state.ActiveID = ""
+				c.beginSearch()
 				c.signal()
 				c.mu.Unlock()
 				_ = r.Close()
@@ -499,13 +724,28 @@ func (c *Coordinator) run() {
 				d = c.cfg.MaxBackoff
 			}
 		}
-		waitErr := c.cfg.Wait(g, d)
+		// The wait is interruptible: a blackout flip breaks it so the loop
+		// re-evaluates at the top instead of finishing the old interval.
+		waitCtx, cancel := context.WithCancel(g)
+		c.mu.Lock()
+		c.blackoutCancel = cancel
+		c.mu.Unlock()
+		waitErr := c.cfg.Wait(waitCtx, d)
+		c.mu.Lock()
+		c.blackoutCancel = nil
+		closed := c.state.Closed || c.ctx.Err() != nil
+		c.mu.Unlock()
+		waitCanceled := waitCtx.Err() != nil
+		cancel()
+		if closed {
+			return
+		}
 		if g.Err() != nil {
 			epoch = 0
 			delay = c.cfg.Backoff
 			continue
 		}
-		if waitErr != nil {
+		if waitErr != nil && !waitCanceled {
 			_ = c.Close()
 			return
 		}

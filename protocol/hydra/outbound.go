@@ -52,6 +52,9 @@ type Outbound struct {
 	outbound.Adapter
 	logger   log.ContextLogger
 	adaptive *adaptive.Coordinator
+	// coverage owns the coverage-sweep acceptance state; nil when the config
+	// carries no coverage_probe_urls (feature off).
+	coverage *coverageRunner
 
 	dialer     N.Dialer
 	serverAddr M.Socksaddr

@@ -40,14 +40,24 @@ func loadVerifiedFixture(t *testing.T) *Catalogue {
 func TestCatalogueExpansionSignedFixture(t *testing.T) {
 	cat := loadVerifiedFixture(t)
 	cands, skips, err := CandidatesFromCatalogue(cat, "12345")
+	if err != nil || len(cands) != 0 || len(skips) != 3 {
+		t.Fatalf("unsupported fixture axes must be reported: candidates=%v skips=%v err=%v", cands, skips, err)
+	}
+}
+
+func checkSupportedFixtureExpansion(t *testing.T) {
+	cat := loadVerifiedFixture(t)
+	cat.Recipes[0].Params = nil
+	cat.Recipes[0].Requires = nil
+	cands, skips, err := CandidatesFromCatalogue(cat, "12345")
 	if err != nil {
-		t.Fatalf("expand asn 12345: %v", err)
+		t.Fatal(err)
 	}
 	if len(cands) != 1 {
 		t.Fatalf("candidates = %d, want 1 (one wss recipe, one wss endpoint)", len(cands))
 	}
 	c := cands[0]
-	if c.ID != "rec-fast" {
+	if c.RecipeID != "rec-fast" {
 		t.Fatalf("candidate ID = %q, want rec-fast", c.ID)
 	}
 	if c.Server != "hy.example.net" || c.ServerPort != 443 {
@@ -71,23 +81,17 @@ func TestCatalogueExpansionSignedFixture(t *testing.T) {
 	if c.Detour != "" {
 		t.Fatalf("candidate DialerOptions must be left zero, got Detour=%q", c.Detour)
 	}
-	// rtc material is counted and skipped, never expanded.
-	if len(skips) == 0 {
-		t.Fatal("skips must record the rtc endpoint the fixture carries")
-	}
-	rtcSkip := false
-	for _, s := range skips {
-		if strings.Contains(s, "rtc-not-wired") && strings.Contains(s, ":34443") && strings.Contains(s, "/hydra-rtc") {
-			rtcSkip = true
-		}
-	}
-	if !rtcSkip {
-		t.Fatalf("skips = %v, want an rtc-not-wired entry for hy.example.net:34443/hydra-rtc", skips)
+	// Incompatible endpoints must not expand or masquerade as unsupported RTC.
+	if len(skips) != 0 {
+		t.Fatalf("unexpected skips: %v", skips)
 	}
 }
 
 func TestCatalogueExpansionUnknownASN(t *testing.T) {
+	checkSupportedFixtureExpansion(t)
 	cat := loadVerifiedFixture(t)
+	cat.Recipes[0].Params = nil
+	cat.Recipes[0].Requires = nil
 	hinted, _, err := CandidatesFromCatalogue(cat, "12345")
 	if err != nil {
 		t.Fatalf("expand asn 12345: %v", err)
@@ -96,7 +100,7 @@ func TestCatalogueExpansionUnknownASN(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expand unknown asn: %v", err)
 	}
-	if len(docOrder) != 1 || docOrder[0].ID != "rec-fast" {
+	if len(docOrder) != 1 || docOrder[0].RecipeID != "rec-fast" {
 		t.Fatalf("unknown asn must fall back to document order, got %+v", docOrder)
 	}
 	if docOrder[0].Server != hinted[0].Server || docOrder[0].ServerPort != hinted[0].ServerPort ||
@@ -105,7 +109,7 @@ func TestCatalogueExpansionUnknownASN(t *testing.T) {
 	}
 	// asn == "" skips the hint phase entirely and must give the same result.
 	empty, _, err := CandidatesFromCatalogue(cat, "")
-	if err != nil || len(empty) != 1 || empty[0].ID != "rec-fast" {
+	if err != nil || len(empty) != 1 || empty[0].RecipeID != "rec-fast" {
 		t.Fatalf("empty asn expansion = %+v err %v, want the document-order candidate", empty, err)
 	}
 }
@@ -201,10 +205,10 @@ func TestCatalogueExpansionOrderHintsFirst(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expand: %v", err)
 	}
-	if len(cands) != 2 {
-		t.Fatalf("candidates = %d, want 2", len(cands))
+	if len(cands) != 3 {
+		t.Fatalf("candidates = %d, want 3", len(cands))
 	}
-	if cands[0].ID != "rec-c" || cands[1].ID != "rec-a" {
+	if cands[0].RecipeID != "rec-c" || cands[1].RecipeID != "rec-a" {
 		t.Fatalf("order = [%s %s], want [rec-c rec-a]: hints first, then document order", cands[0].ID, cands[1].ID)
 	}
 	if cands[1].Server != "a.example.net" || cands[0].Server != "b.example.net" {
@@ -219,12 +223,12 @@ func TestCatalogueExpansionOrderHintsFirst(t *testing.T) {
 			endpointSkip = true
 		}
 	}
-	if !recipeSkip || !endpointSkip {
-		t.Fatalf("skips = %v, want recipe rec-b rtc skip AND srv-b rtc endpoint skip", skips)
+	if recipeSkip || endpointSkip || len(skips) != 0 || cands[2].RecipeID != "rec-b" || cands[2].Transport != "rtc" {
+		t.Fatalf("RTC expansion missing: candidates=%v skips=%v", cands, skips)
 	}
 	// Empty ASN: pure document order [rec-a, rec-c].
 	doc, _, err := CandidatesFromCatalogue(cat, "")
-	if err != nil || len(doc) != 2 || doc[0].ID != "rec-a" || doc[1].ID != "rec-c" {
+	if err != nil || len(doc) != 3 || doc[0].RecipeID != "rec-a" || doc[1].RecipeID != "rec-b" || doc[2].RecipeID != "rec-c" {
 		t.Fatalf("empty asn order = %+v err %v, want [rec-a rec-c]", doc, err)
 	}
 }

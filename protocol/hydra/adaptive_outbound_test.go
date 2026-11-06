@@ -62,7 +62,7 @@ func TestAdaptiveDistinctPaths(t *testing.T) {
 }
 
 func TestAdaptiveValidation(t *testing.T) {
-	for _, name := range []string{"empty", "duplicate-id", "duplicate-endpoint", "server", "port", "proof", "bytes", "timing", "parent-detour", "candidate-detour"} {
+	for _, name := range []string{"empty", "duplicate-id", "duplicate-endpoint", "server", "port", "proof", "bytes", "timing", "recovery-budget", "parent-detour", "candidate-detour"} {
 		t.Run(name, func(t *testing.T) {
 			opts := option.HydraOutboundOptions{Pubkey: encodeB64(make([]byte, 32)), Adaptive: &option.HydraAdaptiveOptions{Candidates: []option.HydraAdaptiveCandidateOptions{{ID: "a", ServerOptions: option.ServerOptions{Server: "127.0.0.1", ServerPort: 443}}}, ProofURL: "https://example.com/proof", ProofBytes: 1024}}
 			a := opts.Adaptive
@@ -87,6 +87,9 @@ func TestAdaptiveValidation(t *testing.T) {
 				a.ProofBytes = 1023
 			case "timing":
 				a.Backoff = -1
+			case "recovery-budget":
+				// Default attempt 10s x 1 candidate exceeds the 5s floor.
+				a.RecoveryBudget = badoption.Duration(5 * time.Second)
 			case "parent-detour":
 				opts.Detour = "active"
 			case "candidate-detour":

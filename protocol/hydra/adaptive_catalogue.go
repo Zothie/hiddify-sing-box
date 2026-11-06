@@ -1,7 +1,9 @@
 package hydra
 
 import (
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -13,9 +15,9 @@ import (
 //
 // CandidatesFromCatalogue turns a VERIFIED catalogue (see
 // LoadAndVerifyCatalogue) into option.HydraAdaptiveCandidateOptions entries
-// for the hydra adaptive outbound. Only the wss transport is wired today:
-// rtc endpoints and rtc recipes are counted in the skips list (reason
-// "rtc-not-wired") and never expanded. Ordering is: recipes referenced by
+// for the hydra adaptive outbound. WSS and RTC recipes expand only matching
+// endpoints. Unsupported params and requirements are reported and skipped.
+// Ordering is: recipes referenced by
 // HintRecipes(asn) first (deduplicated, only existing ids), then the
 // remaining recipes in document order; asn == "" skips the hints entirely.
 //
@@ -38,7 +40,7 @@ const ServerPubkeyLen = 32
 
 // CandidatesFromCatalogue expands cat into adaptive outbound candidates.
 // skips reports catalogue material that was seen but NOT expanded, one
-// entry per item, each carrying a reason token ("rtc-not-wired", "revoked")
+// entry per item, each carrying an unsupported-axis or revoked reason token
 // so callers can filter on it. On any error both lists are nil.
 func CandidatesFromCatalogue(cat *Catalogue, asn string) ([]option.HydraAdaptiveCandidateOptions, []string, error) {
 	if cat == nil {
@@ -49,7 +51,7 @@ func CandidatesFromCatalogue(cat *Catalogue, asn string) ([]option.HydraAdaptive
 		skips      []string
 	)
 	for _, rec := range orderedRecipes(cat, asn) {
-		if rec.Transport != "wss" {
+		if rec.Transport != "wss" && rec.Transport != "rtc" {
 			skips = append(skips, fmt.Sprintf("recipe %s: %s", rec.ID, transportSkipReason(rec.Transport)))
 			continue
 		}
@@ -65,10 +67,34 @@ func CandidatesFromCatalogue(cat *Catalogue, asn string) ([]option.HydraAdaptive
 			skips = append(skips, fmt.Sprintf("recipe %s: server %s revoked", rec.ID, srv.ID))
 			continue
 		}
+		unsupported := false
+		for key := range rec.Params {
+			if key != "max_frame" {
+				skips = append(skips, fmt.Sprintf("recipe %s: unsupported-param-%s", rec.ID, key))
+				unsupported = true
+			}
+		}
+		for key := range rec.Requires {
+			skips = append(skips, fmt.Sprintf("recipe %s: unsupported-requirement-%s", rec.ID, key))
+			unsupported = true
+		}
+		if unsupported {
+			continue
+		}
+		maxFrame, validFrame := RecipeMaxFrame(cat, rec.ID)
+		if _, present := rec.Params["max_frame"]; present && !validFrame {
+			return nil, nil, fmt.Errorf("hydra: recipe %q: invalid max_frame", rec.ID)
+		}
+		if _, err := ServerPubkey(cat, rec.ID); err != nil {
+			return nil, nil, err
+		}
 		wssEndpoints := 0
 		for _, ep := range srv.Endpoints {
+			if ep.Transport != rec.Transport {
+				continue
+			}
 			switch ep.Transport {
-			case "wss":
+			case "wss", "rtc":
 				wssEndpoints++
 				if err := validateCatalogueEndpoint(rec.ID, ep); err != nil {
 					return nil, nil, err
@@ -77,8 +103,18 @@ func CandidatesFromCatalogue(cat *Catalogue, asn string) ([]option.HydraAdaptive
 				if ep.SNI != "" {
 					tls.ServerName = ep.SNI
 				}
+				if rec.Transport == "rtc" {
+					tls = nil
+				}
+				encoded, err := json.Marshal(ep)
+				if err != nil {
+					return nil, nil, err
+				}
+				// Struct JSON fixes field order; neither encoded recipe IDs nor hex
+				// digests contain the ':' separator. Never mix raw recipe IDs here.
+				id := fmt.Sprintf("catalogue:%s:%x", base64.RawURLEncoding.EncodeToString([]byte(rec.ID)), sha256.Sum256(encoded))
 				candidates = append(candidates, option.HydraAdaptiveCandidateOptions{
-					ID: rec.ID,
+					ID: id, RecipeID: rec.ID, Pubkey: srv.Pubkey, NegotiateMaxFrame: maxFrame, Transport: rec.Transport,
 					ServerOptions: option.ServerOptions{
 						Server:     ep.Host,
 						ServerPort: ep.Port,
@@ -86,13 +122,10 @@ func CandidatesFromCatalogue(cat *Catalogue, asn string) ([]option.HydraAdaptive
 					Path: ep.Path,
 					TLS:  tls,
 				})
-			case "rtc":
-				skips = append(skips, fmt.Sprintf("endpoint %s/%s:%d%s: rtc-not-wired",
-					srv.ID, ep.Host, ep.Port, ep.Path))
 			}
 		}
 		if wssEndpoints == 0 {
-			return nil, nil, fmt.Errorf("hydra: catalogue expansion: recipe %q: server %q has no wss endpoint", rec.ID, srv.ID)
+			return nil, nil, fmt.Errorf("hydra: catalogue expansion: recipe %q: server %q has no %s endpoint", rec.ID, srv.ID, rec.Transport)
 		}
 	}
 	return candidates, skips, nil
@@ -104,11 +137,7 @@ func CandidatesFromCatalogue(cat *Catalogue, asn string) ([]option.HydraAdaptive
 // (float64 is the only number kind encoding/json produces); absent key,
 // non-number, fractional or out-of-range values all yield (0, false).
 //
-// There is no per-candidate option field for it: the caller applies the
-// result to HydraOutboundOptions.NegotiateMaxFrame of the outbound that
-// runs this recipe (one outbound per recipe at a time). Adding a
-// NegotiateMaxFrame to HydraAdaptiveCandidateOptions is the plumbing work
-// still pending in option/hydra.go.
+// Expansion carries this value in each candidate's NegotiateMaxFrame.
 func RecipeMaxFrame(cat *Catalogue, recipeID string) (uint32, bool) {
 	if cat == nil {
 		return 0, false
@@ -202,11 +231,8 @@ func findServer(cat *Catalogue, id string) *CatalogueServer {
 	return nil
 }
 
-// transportSkipReason classifies a non-wss recipe transport for the skips list.
+// transportSkipReason classifies an unsupported recipe transport.
 func transportSkipReason(transport string) string {
-	if transport == "rtc" {
-		return "rtc-not-wired"
-	}
 	return "unsupported-transport-" + transport
 }
 

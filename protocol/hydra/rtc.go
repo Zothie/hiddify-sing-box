@@ -29,7 +29,9 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"encoding/hex"
+	"fmt"
 	"net/netip"
+	"os"
 	"time"
 
 	"golang.org/x/crypto/chacha20poly1305"
@@ -692,7 +694,9 @@ func (r *RtcMask) receiveRTP(packet []byte, now time.Time) {
 		return
 	}
 	if counter >= parityCounterBase {
-		r.input.onParityBody(body)
+		// Ignore authenticated legacy parity: it omits original shard lengths.
+		// Original authenticated retransmissions fill gaps without ambiguity.
+		return
 	} else if len(body) >= 4 {
 		r.input.onDataBody(body)
 		if upto, bm, ok := r.input.takeAck(); ok {
@@ -779,6 +783,9 @@ func (r *RtcMask) takeFrames() [][]byte {
 	for _, c := range chunks {
 		got, err := r.framesIn.feed(c)
 		if err != nil || r.framesIn.bad {
+			if os.Getenv("HYDRA_RTC_TRACE") != "" {
+				fmt.Fprintf(os.Stderr, "rtc frame failure peer=%v phase=%d confirmed=%t ctr=%d buffered=%d chunk=%d expected=%d err=%v\n", r.peer, r.phase, r.confirmed, r.framesIn.ctr, len(r.framesIn.buf), len(c), r.input.expected, err)
+			}
 			r.dead = true // tamper/counter desync: fail closed
 			return nil
 		}
