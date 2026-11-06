@@ -201,6 +201,10 @@ func (o *Outbound) Close() error {
 	t, c := o.tunnel, o.adaptive
 	o.tunnel = nil
 	o.mu.Unlock()
+	// Drop the registry entry before closing the coordinator so no reader
+	// finds a tag whose state is about to flip to Closed. Static outbounds
+	// never registered, so this is a no-op for them.
+	adaptive.UnregisterOutbound(o.Tag())
 	if c != nil {
 		return c.Close()
 	}

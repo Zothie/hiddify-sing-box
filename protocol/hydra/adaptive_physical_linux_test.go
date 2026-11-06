@@ -3,8 +3,8 @@
 package hydra
 
 import (
-	"testing"
 	"strings"
+	"testing"
 
 	"github.com/sagernet/sing-box/option"
 )

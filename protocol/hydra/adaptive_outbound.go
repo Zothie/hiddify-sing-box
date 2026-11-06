@@ -147,6 +147,7 @@ func newAdaptiveOutboundWithDependencies(ctx context.Context, router adapter.Rou
 		return nil, err
 	}
 	o.adaptive = c
+	adaptive.RegisterOutbound(tag, c.Snapshot)
 	return o, nil
 }
 

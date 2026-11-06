@@ -15,10 +15,20 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
 )
+
+func mustRead(t *testing.T, path string) []byte {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return data
+}
 
 const defaultServerBin = "/media/varingait/Lobotomite/vpns/hydra/target/release/hydra-server"
 
@@ -35,6 +45,21 @@ func freePort(t *testing.T) int {
 // startRustServer spawns hydra-server with a fresh keypair on a free port.
 func startRustServer(t *testing.T) (serverAddr string, pubkey [32]byte, stop func()) {
 	t.Helper()
+	sk := make([]byte, 32)
+	if _, err := rand.Read(sk); err != nil {
+		t.Fatal(err)
+	}
+	keyPath := filepath.Join(t.TempDir(), "server.key")
+	if err := os.WriteFile(keyPath, []byte(encodeB64(sk)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return startRustServerKeyed(t, keyPath)
+}
+
+// startRustServerKeyed spawns hydra-server with a SHARED key file, so several
+// endpoints can serve as candidates behind one client pubkey.
+func startRustServerKeyed(t *testing.T, keyPath string) (serverAddr string, pubkey [32]byte, stop func()) {
+	t.Helper()
 	bin := os.Getenv("HYDRA_SERVER_BIN")
 	if bin == "" {
 		bin = defaultServerBin
@@ -42,9 +67,9 @@ func startRustServer(t *testing.T) (serverAddr string, pubkey [32]byte, stop fun
 	if _, err := os.Stat(bin); err != nil {
 		t.Skipf("hydra-server binary not present (%s): %v", bin, err)
 	}
-	sk := make([]byte, 32)
-	if _, err := rand.Read(sk); err != nil {
-		t.Fatal(err)
+	sk, err := decodeB64(string(mustRead(t, keyPath)))
+	if err != nil || len(sk) != 32 {
+		t.Fatalf("bad shared key file: %v", err)
 	}
 	pk, err := x25519Pub(sk)
 	if err != nil {
@@ -54,10 +79,6 @@ func startRustServer(t *testing.T) (serverAddr string, pubkey [32]byte, stop fun
 	serverAddr = net.JoinHostPort("127.0.0.1", fmt.Sprint(port))
 
 	var stderr bytes.Buffer
-	keyPath := t.TempDir() + "/server.key"
-	if err := os.WriteFile(keyPath, []byte(encodeB64(sk)), 0o600); err != nil {
-		t.Fatal(err)
-	}
 	cmd := exec.Command(bin, keyPath, serverAddr)
 	cmd.Stderr = &stderr
 	cmd.Stdout = &stderr

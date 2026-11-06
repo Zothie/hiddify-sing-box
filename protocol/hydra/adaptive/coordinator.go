@@ -72,6 +72,8 @@ type Coordinator struct {
 	wake             chan struct{}
 	next             int
 	preferred        bool
+	degraded         bool
+	lastPrewarm      time.Time
 }
 
 func New(parent context.Context, cfg Config) (*Coordinator, error) {
@@ -145,6 +147,24 @@ func (c *Coordinator) Acquire(ctx context.Context) (Resource, error) {
 	}
 }
 func (c *Coordinator) Snapshot() Snapshot { c.mu.Lock(); defer c.mu.Unlock(); return c.state }
+
+// ReportDegraded asks for a make-before-break alternative: while a healthy
+// resource serves traffic, the next eligible candidate is built and verified
+// in the background; on success the active resource is swapped and closed.
+// Repeat calls are folded; a failed alternative keeps the active one serving.
+func (c *Coordinator) ReportDegraded() {
+	c.mu.Lock()
+	if c.state.Closed || c.ctx.Err() != nil {
+		c.mu.Unlock()
+		return
+	}
+	c.degraded = true
+	c.mu.Unlock()
+	select {
+	case c.wake <- struct{}{}:
+	default:
+	}
+}
 func (c *Coordinator) Close() error {
 	c.mu.Lock()
 	if c.state.Closed {
@@ -188,6 +208,40 @@ func (c *Coordinator) ResetNetwork() {
 	case c.wake <- struct{}{}:
 	default:
 	}
+}
+
+// prewarm builds and verifies one alternative candidate while current keeps
+// serving. It consumes the next fair slot (skipping the current ID) and never
+// touches the active resource or the snapshot. Best effort: any failure is a
+// miss, not an error surfaced to callers.
+func (c *Coordinator) prewarm(generation context.Context, current Resource) (Resource, string, bool) {
+	c.mu.Lock()
+	var candidate Candidate
+	for range c.cfg.Candidates {
+		v := c.cfg.Candidates[c.next]
+		c.next = (c.next + 1) % len(c.cfg.Candidates)
+		if c.active == nil || v.ID != c.state.ActiveID {
+			candidate = v
+			break
+		}
+	}
+	if c.state.Closed || generation.Err() != nil || isNilResource(current) && false {
+		c.mu.Unlock()
+		return nil, "", false
+	}
+	c.mu.Unlock()
+	ctx, cancel := context.WithTimeout(generation, c.cfg.AttemptTimeout)
+	defer cancel()
+	alt, err := c.attempt(ctx, candidate)
+	if err != nil || isNilResource(alt) {
+		return nil, "", false
+	}
+	select {
+	case <-alt.Done():
+		return nil, "", false
+	default:
+	}
+	return alt, candidate.ID, true
 }
 
 // attempt permits only one callback worker, including across network resets.
@@ -311,9 +365,36 @@ func (c *Coordinator) run() {
 			c.mu.Unlock()
 			delay = c.cfg.Backoff
 			epoch = 0
-			select {
-			case <-r.Done():
-			case <-g.Done():
+		serveLoop:
+			for {
+				select {
+				case <-r.Done():
+					break serveLoop
+				case <-g.Done():
+					break serveLoop
+				case <-c.wake:
+				}
+				c.mu.Lock()
+				degraded := c.degraded
+				c.degraded = false
+				c.mu.Unlock()
+				// Make-before-break: build and verify one alternative while the
+				// healthy resource keeps serving. Rate-limited by Backoff.
+				if degraded && c.ctx.Err() == nil && time.Since(c.lastPrewarm) >= c.cfg.Backoff {
+					c.lastPrewarm = time.Now()
+					if alt, altID, ok := c.prewarm(g, r); ok {
+						c.mu.Lock()
+						c.active = alt
+						c.state.ActiveID = altID
+						c.state.LastGood = altID
+						c.signal()
+						c.mu.Unlock()
+						_ = r.Close()
+						delay = c.cfg.Backoff
+						epoch = 0
+						r = alt
+					}
+				}
 			}
 			c.mu.Lock()
 			if c.state.Generation == gen && c.active != nil {
