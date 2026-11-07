@@ -13,8 +13,12 @@ func TestRegistryRoundTrip(t *testing.T) {
 	if !ok {
 		t.Fatal("registered tag not found")
 	}
-	if got != want {
-		t.Fatalf("snapshot = %+v, want %+v", got, want)
+	// Snapshot carries PerCandidate (a map) since the axes sweep: compare
+	// field-by-field instead of struct equality.
+	if got.Generation != want.Generation || got.ActiveID != want.ActiveID ||
+		got.LastGood != want.LastGood || got.Attempts != want.Attempts ||
+		got.TotalAttempts != want.TotalAttempts || got.PerCandidate != nil {
+		t.Fatalf("snapshot = %+v, want %+v (PerCandidate nil)", got, want)
 	}
 	UnregisterOutbound("reg-round-trip")
 	if _, ok := SnapshotByTag("reg-round-trip"); ok {

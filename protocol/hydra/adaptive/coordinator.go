@@ -67,6 +67,9 @@ type Snapshot struct {
 	BlackoutReason        string // Why blackout was entered; empty when clear.
 	CoveragePercent       int    // Measured percent of coverage probe URLs answered by the active tunnel; 0 = no coverage probing or nothing measured yet.
 	CoverageTarget        int    // Best coverage observed so far — the bar a replacement candidate must match within hysteresis.
+	// PerCandidate holds attempts per candidate ID (populated in Snapshot;
+	// nil when nothing has been attempted yet). Prewarm attempts included.
+	PerCandidate map[string]uint64
 }
 
 var ErrClosed = errors.New("adaptive coordinator closed")
@@ -270,6 +273,14 @@ func (c *Coordinator) Snapshot() Snapshot {
 	s.TotalAttempts = s.Attempts
 	if s.SearchInProgress {
 		s.SearchElapsed += time.Since(c.searchStarted)
+	}
+	// Per-candidate attempt counts (prewarm included): attribute sweep
+	// activity to concrete recipes instead of inferring from totals.
+	if len(c.stats) > 0 {
+		s.PerCandidate = make(map[string]uint64, len(c.stats))
+		for id, st := range c.stats {
+			s.PerCandidate[id] = uint64(st.attempts)
+		}
 	}
 	return s
 }
