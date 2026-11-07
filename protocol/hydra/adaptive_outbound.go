@@ -154,8 +154,17 @@ func newAdaptiveOutboundWithDependencies(ctx context.Context, router adapter.Rou
 		if maxFrame == 0 && v.RecipeID == "" {
 			maxFrame = options.NegotiateMaxFrame
 		}
+		// Tuning axes resolve with parent fallback BEFORE identity hashing,
+		// so an alias candidate carrying zero axes on a tuned parent is
+		// recognized as the SAME effective configuration (no duplicate
+		// configs), while two variants differing in one axis stay distinct.
+		// Fail-closed on a malformed pad ladder (audit F10).
+		tuned, _, axErr := axesOrDefault(v, hydraParentAxes(options), logger)
+		if axErr != nil {
+			return nil, fmt.Errorf("hydra: candidate %q: %w", v.ID, axErr)
+		}
 		host := strings.ToLower(strings.TrimSuffix(v.Server, "."))
-		identity := v
+		identity := tuned
 		identity.ID = ""
 		identity.RecipeID = ""
 		identity.Pubkey = pubkey
@@ -190,11 +199,10 @@ func newAdaptiveOutboundWithDependencies(ctx context.Context, router adapter.Rou
 				}
 			}
 		}
-		tlsOptions := v.TLS
-		if tlsOptions != nil {
-			copy := *tlsOptions
-			tlsOptions = &copy
-		}
+		// TLS surface axes (tls_fragment / versions / alpn) are applied onto
+		// a copy of the candidate TLS options; the resolved axis values live
+		// on the child's own passthrough fields (single source of truth).
+		tlsOptions := applyTLSAxes(v.TLS, tuned.TLSFragment, tuned.TLSMinVersion, tuned.TLSMaxVersion, tuned.TLSALPN)
 		base, e := factory(ctx, v)
 		if e != nil {
 			return nil, e
@@ -202,7 +210,7 @@ func newAdaptiveOutboundWithDependencies(ctx context.Context, router adapter.Rou
 		if base == nil {
 			return nil, fmt.Errorf("hydra: nil candidate dialer")
 		}
-		child, e := newStaticOutbound(ctx, logger, tag, option.HydraOutboundOptions{ServerOptions: v.ServerOptions, DialerOptions: v.DialerOptions, Pubkey: pubkey, Path: v.Path, TLS: tlsOptions, Transport: v.Transport, NegotiateMaxFrame: maxFrame}, base)
+		child, e := newStaticOutbound(ctx, logger, tag, option.HydraOutboundOptions{ServerOptions: v.ServerOptions, DialerOptions: v.DialerOptions, Pubkey: pubkey, Path: v.Path, TLS: tlsOptions, Transport: v.Transport, NegotiateMaxFrame: maxFrame, FragFirstMin: tuned.FragFirstMin, FragFirstMax: tuned.FragFirstMax, FragRestMin: tuned.FragRestMin, FragRestMax: tuned.FragRestMax, FragSplitDelayMs: tuned.FragSplitDelayMs, Disorder: tuned.Disorder, DisorderDelayMs: tuned.DisorderDelayMs, PadBuckets: tuned.PadBuckets, MaxPad: tuned.MaxPad, BigPadMax: tuned.BigPadMax, RTCChunk: tuned.RTCChunk, RTCWindow: tuned.RTCWindow, RTORtoMinMs: tuned.RTORtoMinMs, RTORtoMaxMs: tuned.RTORtoMaxMs, RTCBufferCap: tuned.RTCBufferCap, RTCKeepaliveEveryMs: tuned.RTCKeepaliveEveryMs, TLSFragment: tuned.TLSFragment, TLSMinVersion: tuned.TLSMinVersion, TLSMaxVersion: tuned.TLSMaxVersion, TLSALPN: tuned.TLSALPN}, base)
 		if e != nil {
 			return nil, e
 		}
@@ -256,11 +264,11 @@ func newAdaptiveOutboundWithDependencies(ctx context.Context, router adapter.Rou
 			if b.rtcTransport {
 				resource, err = connectTunnelRTC(ctx, func(c context.Context) (net.PacketConn, error) {
 					return b.dialer.ListenPacket(c, b.serverAddr)
-				}, b.pubkey[:], b.serverAddr.AddrPort(), logger, b.negotiateMaxFrame)
+				}, b.pubkey[:], b.serverAddr.AddrPort(), logger, b.negotiateMaxFrame, b.axes)
 			} else {
 				resource, err = connectTunnelNegotiate(ctx, func(ctx context.Context) (net.Conn, error) {
 					return b.dialer.DialContext(ctx, N.NetworkTCP, b.serverAddr)
-				}, &b.requestURL, b.headers, b.pubkey[:], logger, b.negotiateMaxFrame)
+				}, &b.requestURL, b.headers, b.pubkey[:], logger, b.negotiateMaxFrame, b.axes)
 			}
 			if err != nil {
 				watcher.record(err)

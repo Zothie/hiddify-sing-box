@@ -12,6 +12,7 @@ import (
 	"encoding/binary"
 	"errors"
 
+	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/zeebo/blake3"
 	"golang.org/x/crypto/chacha20poly1305"
 	"golang.org/x/crypto/curve25519"
@@ -37,23 +38,112 @@ const (
 	MaxFrameLen = 1 << 20
 )
 
+// defaultPadBuckets is the proto.rs bucket ladder used when a candidate
+// carries no pad_buckets axis.
+var defaultPadBuckets = [...]int{256, 1024, 4096, 16384, 65536}
+
+// padBucketMin/Max and maxPadBucketCount bound the pad_buckets axis
+// (TUNING.md A5, audit F10): every bucket must lie in [256,65536], the
+// ladder must be strictly ascending and at most 8 entries, so one hostile
+// catalogue entry cannot turn the padding into an amplification vector.
+const (
+	padBucketMin      = 256
+	padBucketMax      = 65536
+	maxPadBucketCount = 8
+	// bigPadDefault bounds the extra padding of frames above every bucket
+	// (proto.rs rand 0..=4096); the axis can only lower it.
+	bigPadDefault = 4096
+)
+
+// padConfig is the candidate-tuned frame-padding configuration shared by the
+// ws path (padTargetFor/sealCtrFor) and the rtc path (rtc's
+// padTargetWithConfig, which consumes it verbatim). The zero value / nil
+// pointer reproduces proto.rs behavior byte-identically.
+type padConfig struct {
+	// buckets is the ascending bucket ladder; nil = defaultPadBuckets.
+	buckets []int
+	// maxPad caps the random per-bucket slack; 0 = MaxPad (64).
+	maxPad int
+	// bigPadMax bounds the extra padding above every bucket; 0 = 4096.
+	bigPadMax int
+}
+
+// validatePadBuckets fail-closes a pad_buckets axis value: every entry must
+// be an integer in [256,65536], strictly ascending, at most 8 entries.
+func validatePadBuckets(buckets []uint32) error {
+	if len(buckets) > maxPadBucketCount {
+		return E.New("hydra: pad_buckets allows at most ", maxPadBucketCount, " entries, got ", len(buckets))
+	}
+	prev := 0
+	for i, b := range buckets {
+		if b < padBucketMin || b > padBucketMax {
+			return E.New("hydra: pad_buckets entry ", i, " out of range ", padBucketMin, "..", padBucketMax, ": ", b)
+		}
+		if int(b) <= prev {
+			return E.New("hydra: pad_buckets must be strictly ascending, entry ", i, "=", b)
+		}
+		prev = int(b)
+	}
+	return nil
+}
+
+// newPadConfig builds the padding configuration from a validated pad_buckets
+// axis (nil = default ladder) and the max_pad / big_pad_max axes (0 =
+// defaults 64 / 4096).
+func newPadConfig(buckets []uint32, maxPadAxis, bigPadMaxAxis uint32) *padConfig {
+	cfg := &padConfig{maxPad: MaxPad, bigPadMax: bigPadDefault}
+	if maxPadAxis > 0 {
+		cfg.maxPad = min(int(maxPadAxis), MaxPad)
+	}
+	if bigPadMaxAxis > 0 {
+		cfg.bigPadMax = min(int(bigPadMaxAxis), bigPadDefault)
+	}
+	if len(buckets) > 0 {
+		cfg.buckets = make([]int, len(buckets))
+		for i, b := range buckets {
+			cfg.buckets[i] = int(b)
+		}
+	}
+	return cfg
+}
+
+// padTargetFor mirrors proto.rs pad_target under cfg: round the plaintext up
+// to the next size bucket and add 0..=min(slack, cfg.maxPad) random pad
+// bytes (0..=cfg.bigPadMax for frames exceeding every bucket). A nil cfg is
+// the proto.rs default configuration.
+func (c *padConfig) padTargetFor(plainLen int) int {
+	maxPad, bigPad := MaxPad, bigPadDefault
+	buckets := defaultPadBuckets[:]
+	if c != nil {
+		if c.maxPad > 0 {
+			maxPad = c.maxPad
+		}
+		if c.bigPadMax > 0 {
+			bigPad = c.bigPadMax
+		}
+		if len(c.buckets) > 0 {
+			buckets = c.buckets
+		}
+	}
+	need := plainLen + 3 + 16
+	for _, b := range buckets {
+		if need <= b {
+			slack := b - need
+			if slack > maxPad {
+				slack = maxPad
+			}
+			return randRangeInclusive(slack)
+		}
+	}
+	return randRangeInclusive(bigPad)
+}
+
 // padTarget mirrors proto.rs pad_target: round the plaintext up to the next
 // size bucket and add 0..=min(slack, 64) random pad bytes (0..=4096 for
 // frames exceeding every bucket). Only the [pad_len u16][pad][payload] parse
 // format matters for interop; the exact pad length is intentionally random.
 func padTarget(plainLen int) int {
-	buckets := [...]int{256, 1024, 4096, 16384, 65536}
-	need := plainLen + 3 + 16
-	for _, b := range buckets {
-		if need <= b {
-			slack := b - need
-			if slack > MaxPad {
-				slack = MaxPad
-			}
-			return randRangeInclusive(slack)
-		}
-	}
-	return randRangeInclusive(4096)
+	return (*padConfig)(nil).padTargetFor(plainLen)
 }
 
 // randRangeInclusive returns a uniform int in [0, n] (Rust gen_range(0..=n));
@@ -115,17 +205,23 @@ func aadFor(counter uint64) []byte {
 	return binary.BigEndian.AppendUint64(aad, counter)
 }
 
-// sealCtr mirrors proto.rs seal_ctr:
+// sealCtr mirrors proto.rs seal_ctr under the DEFAULT padding configuration:
 // [u32 ctLen][nonce(4 random || counter BE)][ct]; plaintext becomes
 // [padLen u16 BE][pad][payload].
 func sealCtr(aead cipher.AEAD, counter uint64, plaintext []byte) []byte {
+	return sealCtrFor(aead, counter, plaintext, nil)
+}
+
+// sealCtrFor is sealCtr with the candidate's padding configuration; a nil
+// cfg is byte-identical to sealCtr.
+func sealCtrFor(aead cipher.AEAD, counter uint64, plaintext []byte, cfg *padConfig) []byte {
 	nonce := make([]byte, NonceSize)
 	// crypto/rand never fails on Linux short reads; a failure here leaves the
 	// zero prefix which still yields a valid (if weaker) frame.
 	_, _ = rand.Read(nonce[:4])
 	binary.BigEndian.PutUint64(nonce[4:], counter)
 
-	padLen := padTarget(len(plaintext))
+	padLen := cfg.padTargetFor(len(plaintext))
 	inner := make([]byte, 2+padLen+len(plaintext))
 	binary.BigEndian.PutUint16(inner, uint16(padLen))
 	if padLen > 0 {

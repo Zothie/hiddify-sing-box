@@ -95,8 +95,10 @@ func (e *rtcEngine) isDead(now time.Time) bool {
 
 // connectTunnelRTC is the rtc:// twin of connectTunnel. peer is the server's
 // UDP address; serverStatic is the server static pubkey (the same trust
-// anchor as the ws handshake — the CONFIRM frame binds it).
-func connectTunnelRTC(ctx context.Context, packetDial rtcPacketDial, serverStatic []byte, peer netip.AddrPort, logger log.ContextLogger, negotiateMaxFrame uint32) (*Tunnel, error) {
+// anchor as the ws handshake — the CONFIRM frame binds it). Optional axes
+// carry the candidate's rtc engine tuning (chunk/window/rto/buffer/keepalive/
+// pad); zero axes keep the engine defaults.
+func connectTunnelRTC(ctx context.Context, packetDial rtcPacketDial, serverStatic []byte, peer netip.AddrPort, logger log.ContextLogger, negotiateMaxFrame uint32, axes ...tunnelAxes) (*Tunnel, error) {
 	var staticPub [32]byte
 	copy(staticPub[:], serverStatic)
 
@@ -121,7 +123,23 @@ func connectTunnelRTC(ctx context.Context, packetDial rtcPacketDial, serverStati
 	// handover the tunnel lives on its own clocks, exactly like the ws path.
 	stopCancellation := context.AfterFunc(ctx, func() { tunnel.kill(ctx.Err()) })
 
-	eng := &rtcEngine{engine: NewClient(staticPub, peer, time.Now())}
+	ax := firstTunnelAxes(axes)
+	engine := NewClientWithParams(staticPub, peer, time.Now(), rtcChannelParams(ax))
+	// DPI self-gate (rtc pump only): attached BEFORE the pump starts, so the
+	// very first poll samples it. FAIL-TO-OFF is intentional — the gate can
+	// only fail on the embedded model digest check, and a gateless tunnel
+	// beats no tunnel; never fail the dial for a camouflage knob.
+	if ax.dpiGateEnabled {
+		gate, gerr := EnableDPIGate(ax.dpiGateThreshold)
+		if gerr != nil {
+			if logger != nil {
+				logger.Warn("hydra: dpi gate disabled (fail-to-off): ", gerr)
+			}
+		} else {
+			engine.SetDPIGate(gate)
+		}
+	}
+	eng := &rtcEngine{engine: engine}
 	udpAddr := net.UDPAddrFromAddrPort(peer)
 
 	// recv: socket → engine. kill() closes the socket, which unblocks this

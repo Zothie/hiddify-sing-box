@@ -14,6 +14,78 @@ type HydraAdaptiveCandidateOptions struct {
 	// Transport selects the candidate's wire transport: "wss" (default when
 	// empty) or "rtc". Carried per candidate so a group can mix transports.
 	Transport string `json:"transport,omitempty"`
+
+	// Tuning axes (TUNING.md sweep). Every axis is optional: the zero value
+	// falls back to the consumer's own baseline (the ws split path: the Rust
+	// client's frag.rs tuning baseline; everything else: current behavior,
+	// byte-identical to the pre-axes code). A signed catalogue recipe (params
+	// keys below) or a hydra:// solo link fills them in; the effective-options
+	// identity hash covers all of them, so two variants differing only in one
+	// axis stay distinct candidates.
+	//
+	// First-flight split ranges (wss transport). Defaults mirror split.go =
+	// the Rust frag.rs baseline: first segment uniform in 8..64 bytes, rest
+	// uniform in 16..96, 1ms inter-segment pacing; a record at or under
+	// firstMax is never split. Explicit values are clamped into 1..64 /
+	// 1..96 / 0..50ms inside split.go. A catalogued rest_min fine enough to
+	// exceed the server's AttackCheck read budget is skipped at expansion
+	// (server-fatal shape, explicit unsafe-param reason).
+	FragFirstMin uint32 `json:"frag_first_min,omitempty"`
+	FragFirstMax uint32 `json:"frag_first_max,omitempty"`
+	FragRestMin  uint32 `json:"frag_rest_min,omitempty"`
+	FragRestMax  uint32 `json:"frag_rest_max,omitempty"`
+	// FragSplitDelayMs sleeps between the segments of the first flight
+	// (0 = the Rust default pacing of 1ms; explicit values clamp to 0..50).
+	FragSplitDelayMs uint32 `json:"split_delay_ms,omitempty"`
+	// Disorder sends the first ClientHello segment with IP TTL 1 (it dies at
+	// the first router hop, so DPI never inspects the SNI) and restores the
+	// saved TTL after the first write; a setsockopt failure falls back to
+	// plain fragmentation. DisorderDelayMs (default 10ms, clamp 1..100)
+	// paces the retransmission.
+	Disorder        bool   `json:"disorder,omitempty"`
+	DisorderDelayMs uint32 `json:"disorder_delay_ms,omitempty"`
+	// PadBuckets replaces the frame-padding bucket ladder (applied to both
+	// pad sites: the ws path and the rtc path). Validation is fail-closed:
+	// strictly ascending, each 256..=65536, at most 8 entries (an
+	// amplification bound against hostile catalogues).
+	PadBuckets []uint32 `json:"pad_buckets,omitempty"`
+	// MaxPad caps the random per-bucket slack (clamp 1..64, default 64 —
+	// proto.rs MAX_PAD). BigPadMax bounds the extra padding of frames above
+	// every bucket (clamp 1..4096, default 4096).
+	MaxPad    uint32 `json:"max_pad,omitempty"`
+	BigPadMax uint32 `json:"big_pad_max,omitempty"`
+	// RTC engine axes (rtc transport). Zero = engine defaults (chunk 1150,
+	// window 128, rto 250/3000ms, buffer 512, keepalive 5s); explicit values
+	// clamp to the engine domains 256..1180 / 16..1024 / 50..500 /
+	// 1000..10000 / 128..2048 / 2000..15000 (ms). These are server-coupled:
+	// a chunk mismatch desyncs the framing, so catalogue variants must carry
+	// server-agreed values.
+	RTCChunk            uint32 `json:"rtc_chunk,omitempty"`
+	RTCWindow           uint32 `json:"rtc_window,omitempty"`
+	RTORtoMinMs         uint32 `json:"rto_min,omitempty"`
+	RTORtoMaxMs         uint32 `json:"rto_max,omitempty"`
+	RTCBufferCap        uint32 `json:"buffer_cap,omitempty"`
+	RTCKeepaliveEveryMs uint32 `json:"keepalive_every,omitempty"`
+	// TLS surface variants (sing-box TLS layer options threaded into the
+	// child outbound's TLS config). Defaults = the current config (TLS 1.3
+	// pin, http/1.1 ALPN). tls_server_name / SNI is already swept per
+	// endpoint via the catalogue endpoint SNI field.
+	TLSFragment   bool     `json:"tls_fragment,omitempty"`
+	TLSMinVersion string   `json:"tls_min_version,omitempty"`
+	TLSMaxVersion string   `json:"tls_max_version,omitempty"`
+	TLSALPN       []string `json:"tls_alpn,omitempty"`
+	// DPI gate axes (rtc transport only — the Rust client gates the rtc
+	// pump; wss stays ungated). DPIGateEnabled turns on the embedded
+	// ClientSelfGate (100% verdict parity against the Rust-exported
+	// fixtures); a raise rotates the session mask and rebuilds the tunnel.
+	// Default false = today's ungated behavior. DPIGateThreshold is the
+	// raise threshold (Rust HYDRA_DPI_THRESHOLD; default 0.5 when enabled
+	// without a threshold); 0 with enabled=true is passed through VERBATIM
+	// ("raise on everything" — the deliberate rebuild-path probe value), so
+	// a config-builder round trip must not rely on the omitted-zero JSON
+	// form for it. Valid domain 0..1; outside fails construction.
+	DPIGateEnabled   bool    `json:"dpi_gate,omitempty"`
+	DPIGateThreshold float32 `json:"dpi_threshold,omitempty"`
 }
 
 type HydraAdaptiveOptions struct {
@@ -110,4 +182,37 @@ type HydraOutboundOptions struct {
 	// For grouped links it is carried onto the candidate; a static (solo)
 	// outbound keeps it on itself.
 	Transport string `json:"transport,omitempty"`
+
+	// Tuning-axes passthrough (TUNING.md sweep), same fields and semantics
+	// as HydraAdaptiveCandidateOptions: on a static (solo) outbound they
+	// tune this outbound directly; on an adaptive group they are the GROUP
+	// DEFAULTS every candidate inherits when its own axis is zero (the
+	// candidate value wins). Zero everywhere = the byte-identical legacy
+	// behavior. All omitempty so plain configs marshal unchanged.
+	FragFirstMin        uint32   `json:"frag_first_min,omitempty"`
+	FragFirstMax        uint32   `json:"frag_first_max,omitempty"`
+	FragRestMin         uint32   `json:"frag_rest_min,omitempty"`
+	FragRestMax         uint32   `json:"frag_rest_max,omitempty"`
+	FragSplitDelayMs    uint32   `json:"split_delay_ms,omitempty"`
+	Disorder            bool     `json:"disorder,omitempty"`
+	DisorderDelayMs     uint32   `json:"disorder_delay_ms,omitempty"`
+	PadBuckets          []uint32 `json:"pad_buckets,omitempty"`
+	MaxPad              uint32   `json:"max_pad,omitempty"`
+	BigPadMax           uint32   `json:"big_pad_max,omitempty"`
+	RTCChunk            uint32   `json:"rtc_chunk,omitempty"`
+	RTCWindow           uint32   `json:"rtc_window,omitempty"`
+	RTORtoMinMs         uint32   `json:"rto_min,omitempty"`
+	RTORtoMaxMs         uint32   `json:"rto_max,omitempty"`
+	RTCBufferCap        uint32   `json:"buffer_cap,omitempty"`
+	RTCKeepaliveEveryMs uint32   `json:"keepalive_every,omitempty"`
+	TLSFragment         bool     `json:"tls_fragment,omitempty"`
+	TLSMinVersion       string   `json:"tls_min_version,omitempty"`
+	TLSMaxVersion       string   `json:"tls_max_version,omitempty"`
+	TLSALPN             []string `json:"tls_alpn,omitempty"`
+	// DPI gate axes (rtc only), same contract as on the candidate:
+	// enabled=false stays ungated and inherits the candidate's own axis;
+	// the threshold rides verbatim when the gate is on (0 = deliberate
+	// raise-on-everything probe value).
+	DPIGateEnabled   bool    `json:"dpi_gate,omitempty"`
+	DPIGateThreshold float32 `json:"dpi_threshold,omitempty"`
 }

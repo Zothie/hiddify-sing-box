@@ -46,7 +46,9 @@ const (
 	rtcHandshakeTimeout = 12 * time.Second
 	// idleTimeout declares the flow dead with no verified inbound traffic.
 	idleTimeout = 30 * time.Second
-	// keepaliveEvery is the keepalive cadence (RTCP SR + ICE consent refresh).
+	// keepaliveEvery is the DEFAULT keepalive cadence (RTCP SR + ICE consent
+	// refresh); candidates override it through RtcChannelParams.KeepaliveEvery
+	// (the packet shape never changes, only this timer).
 	keepaliveEvery = 5 * time.Second
 	// helloRetry is the client hello retransmit cadence while handshaking.
 	helloRetry = time.Second
@@ -156,35 +158,66 @@ func openMask(aead cipher.AEAD, sealed []byte) (uint64, []byte, bool) {
 	return counter, plain, true
 }
 
+// rtcPadConfig carries the pad-axis knobs for the mask engine (padTargetWith)
+// — the RTC-local twin of crypto.go's ws-path padConfig. Same default shape
+// (proto.rs bucket set, MaxPad = 64, big-frame bound 4096) but LITERAL zero
+// semantics: maxPad/bigPad 0 means zero padding (deterministic goldens), not
+// the ws path's 0-means-default; normalize() decides which value lands here.
+// Buckets shape the frame-length histogram an observer sees; maxPad caps the
+// draw inside a bucket; bigPad bounds the draw for frames exceeding every
+// bucket. padLen travels in-frame, so ANY config stays wire-compatible — the
+// receiver is length-agnostic.
+type rtcPadConfig struct {
+	buckets []int
+	maxPad  int
+	bigPad  int
+}
+
+func defaultPadConfig() rtcPadConfig {
+	return rtcPadConfig{
+		buckets: append([]int(nil), defaultPadBuckets[:]...),
+		maxPad:  MaxPad,
+		bigPad:  defaultBigFramePadMax,
+	}
+}
+
 // padTargetWith mirrors proto.rs pad_target: bucketed padding — round
-// (payload+overhead) up to the next bucket, then draw 0..=min(slack, MaxPad)
-// pad bytes (0..=4096 for frames exceeding every bucket). An observer learns
+// (payload+overhead) up to the next bucket, then draw 0..=min(slack, maxPad)
+// pad bytes (0..=bigPad for frames exceeding every bucket). An observer learns
 // only the size bucket, not the exact payload length.
-func padTargetWith(plainLen int, rs maskRand) int {
-	buckets := [...]int{256, 1024, 4096, 16384, 65536}
+func padTargetWith(plainLen int, rs maskRand, cfg rtcPadConfig) int {
 	need := plainLen + 3 + 16
-	for _, b := range buckets {
+	for _, b := range cfg.buckets {
 		if need <= b {
 			slack := b - need
-			if slack > MaxPad {
-				slack = MaxPad
+			if slack > cfg.maxPad {
+				slack = cfg.maxPad
 			}
 			return rs.intn(slack)
 		}
 	}
-	return rs.intn(4096)
+	return rs.intn(cfg.bigPad)
 }
 
 // sealCtrWith is the entropy-driven variant of proto.rs seal_ctr used by the
 // mask engine: [u32 ctLen][nonce(4 rand + counter BE)][ct]; the plaintext
 // becomes [padLen u16][pad][payload]. Receiving uses crypto.go's openCtr
 // (decryption is deterministic, so the shared helper serves both directions).
+// Uses the default pad config (pre-handshake hello frames keep the fixed
+// proto.rs shape); data frames go through sealCtrPad with the engine's pad
+// axis config.
 func sealCtrWith(aead cipher.AEAD, counter uint64, plaintext []byte, rs maskRand) []byte {
+	return sealCtrPad(aead, counter, plaintext, rs, defaultPadConfig())
+}
+
+// sealCtrPad is sealCtrWith with an explicit pad config (the pad axis).
+// padLen travels in-frame, so any config is wire-compatible.
+func sealCtrPad(aead cipher.AEAD, counter uint64, plaintext []byte, rs maskRand, cfg rtcPadConfig) []byte {
 	nonce := make([]byte, NonceSize)
 	rs.fill(nonce[:4])
 	binary.BigEndian.PutUint64(nonce[4:], counter)
 
-	padLen := padTargetWith(len(plaintext), rs)
+	padLen := padTargetWith(len(plaintext), rs, cfg)
 	inner := make([]byte, 2+padLen+len(plaintext))
 	binary.BigEndian.PutUint16(inner, uint16(padLen))
 	if padLen > 0 {
@@ -209,6 +242,11 @@ type RtcPoll struct {
 	Connected bool
 	// Dead reports terminal state (handshake timeout / idle / tamper).
 	Dead bool
+	// RotateMask reports that the ML-DPI self-gate (dpigate.go) judged the
+	// own wire tunnel-like: Dead is set for the same poll so the pump kills
+	// the tunnel and the adaptive layer rebuilds it with a fresh mask
+	// (Rust tunnel.rs run_rtc_pump: gate raise -> dead.store(true)).
+	RotateMask bool
 }
 
 type rtcPhase uint8
@@ -262,26 +300,66 @@ type RtcMask struct {
 	pendingOut [][]byte
 	ackCounter uint64
 	kaCounter  uint64
+	// chunk/window are THIS endpoint's reliable-layer params after resolve:
+	// chunk sizes the frames this endpoint cuts for the wire, window gates
+	// this endpoint's own sender. The peer's values are independent; see
+	// RtcChannelParams for the both-ends coupling contract.
+	chunk  int
+	window int
+	// rtoMinMs/rtoMaxMs gate this endpoint's retransmission timer (D1 axis),
+	// keepaliveEvery is this endpoint's consent/SR cadence (D3 axis, shape
+	// unchanged) and padCfg is this endpoint's frame pad shape (pad axis).
+	// All are one-sided knobs; coupling notes live on RtcChannelParams.
+	rtoMinMs       float64
+	rtoMaxMs       float64
+	keepaliveEvery time.Duration
+	padCfg         rtcPadConfig
 
 	wire [][]byte
 	dead bool
+	// dpiGate is the optional client ML-DPI self-check (dpigate.go), attached
+	// with SetDPIGate before the pump starts. Poll samples it over the final
+	// outgoing wire; a raise dead-flags the engine (mask rotation rebuild).
+	dpiGate   *ClientSelfGate
+	dpiRotate bool
 
 	rs maskRand
 }
 
 // NewClient creates the client endpoint; it initiates the masked handshake.
+// Default channel params (Chunk 1150 / Window 128) — byte-identical to the
+// pre-params engine.
 func NewClient(staticPub [32]byte, peer netip.AddrPort, now time.Time) *RtcMask {
 	return newClientWithEntropy(staticPub, peer, now, defaultMaskRand)
 }
 
+// NewClientWithParams creates the client endpoint with explicit reliable-layer
+// channel params (chunk + window). Zero fields keep the current defaults; the
+// both-ends coupling contract lives on RtcChannelParams.
+func NewClientWithParams(staticPub [32]byte, peer netip.AddrPort, now time.Time, params RtcChannelParams) *RtcMask {
+	return newClientWithEntropyParams(staticPub, peer, now, defaultMaskRand, params)
+}
+
 // NewServer creates the passive server endpoint; flow state is only completed
 // after the STUN integrity check passes (pre-auth gate — junk floods are
-// refused before any allocation).
+// refused before any allocation). Default channel params.
 func NewServer(staticPub, staticPriv [32]byte, peer netip.AddrPort, now time.Time) *RtcMask {
 	return newServerWithEntropy(staticPub, staticPriv, peer, now, defaultMaskRand)
 }
 
+// NewServerWithParams is NewServer with explicit reliable-layer channel
+// params (chunk + window) for the server's own direction.
+func NewServerWithParams(staticPub, staticPriv [32]byte, peer netip.AddrPort, now time.Time, params RtcChannelParams) *RtcMask {
+	return newServerWithEntropyParams(staticPub, staticPriv, peer, now, defaultMaskRand, params)
+}
+
 func newClientWithEntropy(staticPub [32]byte, peer netip.AddrPort, now time.Time, rs maskRand) *RtcMask {
+	return newClientWithEntropyParams(staticPub, peer, now, rs, RtcChannelParams{})
+}
+
+func newClientWithEntropyParams(staticPub [32]byte, peer netip.AddrPort, now time.Time, rs maskRand, params RtcChannelParams) *RtcMask {
+	n := params.normalize()
+	chunk, window := n.Chunk, n.Window
 	salt := make([]byte, 16)
 	rs.fill(salt)
 	skey := stunKey(staticPub[:], salt)
@@ -312,63 +390,90 @@ func newClientWithEntropy(staticPub [32]byte, peer netip.AddrPort, now time.Time
 	var salt16 [16]byte
 	copy(salt16[:], salt)
 	m := &RtcMask{
-		server:      false,
-		started:     now,
-		lastRx:      now,
-		lastKeepal:  now,
-		lastHello:   now,
-		phase:       phaseHandshake,
-		established: false,
-		confirmed:   false,
-		ssrc:        randUint32Max1(),
-		rtpSeq:      randUint16(),
-		tsOrigin:    randUint32Max1(),
-		peer:        peer,
-		staticPub:   staticPub,
-		salt:        salt16,
-		skey:        skey,
-		txn:         asTxn12(txn),
-		clientEpub:  epub,
-		cachedPkt:   append([]byte{}, pkt...),
-		clientDH:    dh,
-		frameOutCtr: 1, // client data frames start at 1 (as in ws mode)
-		out:         placeholderOut(),
-		input:       newInChannel(),
-		ackCounter:  1,
-		kaCounter:   1,
-		wire:        [][]byte{append([]byte{}, pkt...)},
-		dead:        false,
-		rs:          rs,
+		server:         false,
+		started:        now,
+		lastRx:         now,
+		lastKeepal:     now,
+		lastHello:      now,
+		phase:          phaseHandshake,
+		established:    false,
+		confirmed:      false,
+		ssrc:           randUint32Max1(),
+		rtpSeq:         randUint16(),
+		tsOrigin:       randUint32Max1(),
+		peer:           peer,
+		staticPub:      staticPub,
+		salt:           salt16,
+		skey:           skey,
+		txn:            asTxn12(txn),
+		clientEpub:     epub,
+		cachedPkt:      append([]byte{}, pkt...),
+		clientDH:       dh,
+		frameOutCtr:    1, // client data frames start at 1 (as in ws mode)
+		out:            placeholderOut(),
+		input:          newInChannelCap(n.BufferCap),
+		ackCounter:     1,
+		kaCounter:      1,
+		chunk:          chunk,
+		window:         window,
+		rtoMinMs:       n.RtoMinMs,
+		rtoMaxMs:       n.RtoMaxMs,
+		keepaliveEvery: n.KeepaliveEvery,
+		padCfg: rtcPadConfig{
+			buckets: n.PadBuckets,
+			maxPad:  n.MaxPad,
+			bigPad:  n.BigFramePadMax,
+		},
+		wire: [][]byte{append([]byte{}, pkt...)},
+		dead: false,
+		rs:   rs,
 	}
 	return m
 }
 
 func newServerWithEntropy(staticPub, staticPriv [32]byte, peer netip.AddrPort, now time.Time, rs maskRand) *RtcMask {
+	return newServerWithEntropyParams(staticPub, staticPriv, peer, now, rs, RtcChannelParams{})
+}
+
+func newServerWithEntropyParams(staticPub, staticPriv [32]byte, peer netip.AddrPort, now time.Time, rs maskRand, params RtcChannelParams) *RtcMask {
 	skey := stunKey(staticPub[:], make([]byte, 16))
-	return &RtcMask{
-		server:      true,
-		started:     now,
-		lastRx:      now,
-		lastKeepal:  now,
-		lastHello:   now,
-		phase:       phaseHandshake,
-		established: false,
-		confirmed:   true,
-		ssrc:        randUint32Max1(),
-		rtpSeq:      randUint16(),
-		tsOrigin:    randUint32Max1(),
-		peer:        peer,
-		staticPub:   staticPub,
-		staticPriv:  append([]byte{}, staticPriv[:]...),
-		skey:        skey,
-		frameOutCtr: 1, // 1 = CONFIRM, data from 2 (as in ws mode)
-		out:         placeholderOut(),
-		input:       newInChannel(),
-		ackCounter:  1,
-		kaCounter:   1,
-		dead:        false,
-		rs:          rs,
+	n := params.normalize()
+	chunk, window := n.Chunk, n.Window
+	m := &RtcMask{
+		server:         true,
+		started:        now,
+		lastRx:         now,
+		lastKeepal:     now,
+		lastHello:      now,
+		phase:          phaseHandshake,
+		established:    false,
+		confirmed:      true,
+		ssrc:           randUint32Max1(),
+		rtpSeq:         randUint16(),
+		tsOrigin:       randUint32Max1(),
+		peer:           peer,
+		staticPub:      staticPub,
+		staticPriv:     append([]byte{}, staticPriv[:]...),
+		skey:           skey,
+		frameOutCtr:    1, // 1 = CONFIRM, data from 2 (as in ws mode)
+		out:            placeholderOut(),
+		input:          newInChannelCap(n.BufferCap),
+		ackCounter:     1,
+		kaCounter:      1,
+		chunk:          chunk,
+		window:         window,
+		rtoMinMs:       n.RtoMinMs,
+		rtoMaxMs:       n.RtoMaxMs,
+		keepaliveEvery: n.KeepaliveEvery,
+		padCfg: rtcPadConfig{
+			buckets: n.PadBuckets,
+			maxPad:  n.MaxPad,
+			bigPad:  n.BigFramePadMax,
+		},
+		dead: false,
+		rs:   rs,
 	}
+	return m
 }
 
 // Peer returns the configured remote address.
@@ -397,13 +502,13 @@ func (r *RtcMask) SendFrame(plain []byte) {
 	if !r.Connected() || r.dead {
 		return
 	}
-	sealed := sealCtrWith(r.frameCipher, r.frameOutCtr, plain, r.rs)
+	sealed := sealCtrPad(r.frameCipher, r.frameOutCtr, plain, r.rs, r.padCfg)
 	r.frameOutCtr++
 	// sealed already carries its [u32 ctLen] prefix — the exact bytes the ws
 	// transport would put on the wire; the peer's frameStream decodes them
 	// identically.
-	for off := 0; off < len(sealed); off += Chunk {
-		end := off + Chunk
+	for off := 0; off < len(sealed); off += r.chunk {
+		end := off + r.chunk
 		if end > len(sealed) {
 			end = len(sealed)
 		}
@@ -636,9 +741,9 @@ func (r *RtcMask) activate(now time.Time, fc, rc cipher.AEAD) {
 	r.rtcCipher = rc
 	rcCipher := rc
 	rs := r.rs
-	r.out = newOutChannel(func(counter uint64, body []byte) []byte {
+	r.out = newOutChannelAxis(func(counter uint64, body []byte) []byte {
 		return sealMaskWith(rcCipher, counter, body, rs)
-	})
+	}, r.window, r.rtoMinMs, r.rtoMaxMs)
 	if r.server {
 		r.framesIn = newFrameStream(fc, 1) // client data from ctr 1
 	}
@@ -651,10 +756,10 @@ func (r *RtcMask) activate(now time.Time, fc, rc cipher.AEAD) {
 // pushFrameRaw seals + queues a frame bypassing the Connected() gate
 // (handshake frames).
 func (r *RtcMask) pushFrameRaw(plain []byte) {
-	sealed := sealCtrWith(r.frameCipher, r.frameOutCtr, plain, r.rs)
+	sealed := sealCtrPad(r.frameCipher, r.frameOutCtr, plain, r.rs, r.padCfg)
 	r.frameOutCtr++
-	for off := 0; off < len(sealed); off += Chunk {
-		end := off + Chunk
+	for off := 0; off < len(sealed); off += r.chunk {
+		end := off + r.chunk
 		if end > len(sealed) {
 			end = len(sealed)
 		}
@@ -720,7 +825,7 @@ func (r *RtcMask) receiveRTP(packet []byte, now time.Time) {
 // keepalives. It returns outgoing wire datagrams and decrypted frames.
 func (r *RtcMask) Poll(now time.Time) RtcPoll {
 	if r.dead {
-		return RtcPoll{Dead: true}
+		return RtcPoll{Dead: true, RotateMask: r.dpiRotate}
 	}
 	switch r.phase {
 	case phaseHandshake:
@@ -733,7 +838,7 @@ func (r *RtcMask) Poll(now time.Time) RtcPoll {
 		for _, p := range r.out.pollRetransmit(now) {
 			r.wire = append(r.wire, r.wrap(p.Counter, p.Body, now))
 		}
-		if now.Sub(r.lastKeepal) >= keepaliveEvery {
+		if now.Sub(r.lastKeepal) >= r.keepaliveEvery {
 			r.lastKeepal = now
 			if r.rtcCipher != nil {
 				// RTCP-SR-shaped keepalive (20-byte sender-info body)
@@ -760,6 +865,18 @@ func (r *RtcMask) Poll(now time.Time) RtcPoll {
 			r.wire = append(r.wire, ka)
 		}
 	}
+	// ClientSelfGate sampling (dpigate.go): judge the final outgoing wire,
+	// exactly the Rust run_rtc_pump poll.wire hook. A raise means the own
+	// wire reads as a tunnel: dead-flag the engine so the tunnel is rebuilt
+	// with a fresh mask.
+	if r.dpiGate != nil {
+		for _, pkt := range r.wire {
+			if _, raise := r.dpiGate.Observe(pkt); raise {
+				r.dpiRotate = true
+				r.dead = true
+			}
+		}
+	}
 	frames := r.takeFrames()
 	wire := r.wire
 	r.wire = nil
@@ -768,7 +885,7 @@ func (r *RtcMask) Poll(now time.Time) RtcPoll {
 	if dead {
 		r.dead = true
 	}
-	return RtcPoll{Wire: wire, Frames: frames, Connected: connected, Dead: dead}
+	return RtcPoll{Wire: wire, Frames: frames, Connected: connected, Dead: dead, RotateMask: r.dpiRotate}
 }
 
 func (r *RtcMask) takeFrames() [][]byte {

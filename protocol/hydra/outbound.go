@@ -68,6 +68,9 @@ type Outbound struct {
 	// negotiateMaxFrame is the parent negotiate_max_frame option (0 =
 	// disabled legacy behavior).
 	negotiateMaxFrame uint32
+	// axes are the resolved tuning axes of this outbound (zero = legacy
+	// behavior); threaded into every tunnel (re)build.
+	axes tunnelAxes
 
 	mu       sync.Mutex
 	tunnel   *Tunnel
@@ -98,6 +101,13 @@ func newStaticOutbound(ctx context.Context, logger log.ContextLogger, tag string
 	if options.NegotiateMaxFrame != 0 && (options.NegotiateMaxFrame < maxFrameMin || options.NegotiateMaxFrame > maxFrameMax) {
 		return nil, E.New("hydra: negotiate_max_frame must be 0 or 1024..=65536")
 	}
+	// Tuning axes (catalogue recipe or solo link): fail-closed on a malformed
+	// pad ladder (audit F10), clamped engine ranges elsewhere. Zero axes keep
+	// the byte-identical legacy behavior.
+	axes, err := resolveCandidateAxes(hydraParentAxes(options), logger)
+	if err != nil {
+		return nil, err
+	}
 	serverAddr := options.ServerOptions.Build()
 	if serverAddr.Port == 0 {
 		// Rust client defaults the port to 443 when the URL carries none.
@@ -123,7 +133,17 @@ func newStaticOutbound(ctx context.Context, logger log.ContextLogger, tag string
 		}
 		transportDialer = outboundDialer // UDP socket via dialer.ListenPacket
 	} else {
-		transportDialer, err = buildTLSConfigAndDialer(ctx, logger, outboundDialer, serverAddr, options.TLS)
+		// TLS surface axes (fragment / version / ALPN) ride the child's TLS
+		// options; applied onto a copy so the caller's config is never
+		// mutated (the builder reuses options across candidates).
+		tlsOptions := applyTLSAxes(options.TLS, options.TLSFragment, options.TLSMinVersion, options.TLSMaxVersion, options.TLSALPN)
+		// Disorder (audit F2) arms the BASE dialer — the raw TCP socket below
+		// TLS — never the fragmenting conn.
+		baseDialer := N.Dialer(outboundDialer)
+		if axes.split.Disorder {
+			baseDialer = ttlDisorderDialer{Dialer: outboundDialer, Params: axes.split}
+		}
+		transportDialer, err = buildTLSConfigAndDialer(ctx, logger, baseDialer, serverAddr, tlsOptions, axes.split)
 		if err != nil {
 			return nil, err
 		}
@@ -165,7 +185,32 @@ func newStaticOutbound(ctx context.Context, logger log.ContextLogger, tag string
 		pubkey:            pubkey,
 		rtcTransport:      rtcTransport,
 		negotiateMaxFrame: options.NegotiateMaxFrame,
+		axes:              axes,
 	}, nil
+}
+
+// applyTLSAxes returns a copy of tlsOptions with the candidate's TLS surface
+// axes applied (tls_fragment / tls_min_version / tls_max_version / tls_alpn).
+// A nil or disabled TLS block ignores the axes (there is no TLS layer to
+// tune); empty axis values keep the current configuration.
+func applyTLSAxes(tlsOptions *option.OutboundTLSOptions, fragment bool, minVersion, maxVersion string, alpn []string) *option.OutboundTLSOptions {
+	if tlsOptions == nil || !tlsOptions.Enabled {
+		return tlsOptions
+	}
+	copied := *tlsOptions
+	if fragment {
+		copied.Fragment = true
+	}
+	if minVersion != "" {
+		copied.MinVersion = minVersion
+	}
+	if maxVersion != "" {
+		copied.MaxVersion = maxVersion
+	}
+	if len(alpn) > 0 {
+		copied.ALPN = alpn
+	}
+	return &copied
 }
 
 // getTunnel returns the live tunnel, rebuilding it (serialized) when dead.
@@ -205,11 +250,11 @@ func (o *Outbound) getTunnel(ctx context.Context) (*Tunnel, error) {
 	case o.rtcTransport:
 		t, err = connectTunnelRTC(ctx, func(c context.Context) (net.PacketConn, error) {
 			return o.dialer.ListenPacket(c, o.serverAddr)
-		}, o.pubkey[:], o.serverAddr.AddrPort(), o.logger, o.negotiateMaxFrame)
+		}, o.pubkey[:], o.serverAddr.AddrPort(), o.logger, o.negotiateMaxFrame, o.axes)
 	case o.negotiateMaxFrame != 0:
-		t, err = connectTunnelNegotiate(ctx, dialFn, &o.requestURL, o.headers, o.pubkey[:], o.logger, o.negotiateMaxFrame)
+		t, err = connectTunnelNegotiate(ctx, dialFn, &o.requestURL, o.headers, o.pubkey[:], o.logger, o.negotiateMaxFrame, o.axes)
 	default:
-		t, err = connectTunnel(ctx, dialFn, &o.requestURL, o.headers, o.pubkey[:], o.logger)
+		t, err = connectTunnel(ctx, dialFn, &o.requestURL, o.headers, o.pubkey[:], o.logger, o.axes)
 	}
 	if err != nil {
 		return nil, err

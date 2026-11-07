@@ -78,6 +78,10 @@ type Tunnel struct {
 	// Written only by negotiate() inside connectTunnelOffer before the
 	// tunnel is handed out, read by sessions afterwards.
 	maxFrame uint32
+	// padCfg is the candidate's frame-padding configuration (nil = the
+	// proto.rs default ladder). Set from the tunnelAxes at construction,
+	// before the hello frame is sealed, and read by writerLoop afterwards.
+	padCfg *padConfig
 	// negotiationResult records how the negotiation settled (accepted /
 	// rejected reason / timeout fallback) for logs and tests.
 	negotiationResult string
@@ -134,7 +138,7 @@ func (t *Tunnel) writerLoop() {
 		select {
 		case plain := <-t.out:
 			ctr := t.ctr.Add(1) - 1
-			frame := sealCtr(t.aead, ctr, plain)
+			frame := sealCtrFor(t.aead, ctr, plain, t.padCfg)
 			// WebsocketConn forbids deadlines (SetDeadline -> os.ErrInvalid),
 			// so the 15s write-stall timeout is enforced by aborting the raw
 			// transport conn, which unblocks the write with an error — the
@@ -371,21 +375,32 @@ func (t *Tunnel) openUDP() *udpSession {
 
 // connectTunnel performs dial + WS upgrade + the hydra handshake and starts
 // the reader/writer pumps. dial must return the (TLS-wrapped) transport conn;
-// requestURL carries scheme (ws/wss), Host header and path.
-func connectTunnel(ctx context.Context, dial DialFunc, requestURL *url.URL, headers http.Header, serverStatic []byte, logger log.ContextLogger) (*Tunnel, error) {
-	return connectTunnelOffer(ctx, dial, requestURL, headers, serverStatic, logger, nil)
+// requestURL carries scheme (ws/wss), Host header and path. Optional axes
+// carry the candidate tuning (frame padding); zero axes keep the legacy
+// byte-identical behavior.
+func connectTunnel(ctx context.Context, dial DialFunc, requestURL *url.URL, headers http.Header, serverStatic []byte, logger log.ContextLogger, axes ...tunnelAxes) (*Tunnel, error) {
+	return connectTunnelOffer(ctx, dial, requestURL, headers, serverStatic, logger, nil, axes...)
 }
 
 // connectTunnelNegotiate is connectTunnel plus session negotiation offering
 // maxFrame (frame types 8/9/10, negotiate.go). Values outside 1024..=65536
 // disable negotiation instead of producing an invalid offer.
-func connectTunnelNegotiate(ctx context.Context, dial DialFunc, requestURL *url.URL, headers http.Header, serverStatic []byte, logger log.ContextLogger, maxFrame uint32) (*Tunnel, error) {
-	return connectTunnelOffer(ctx, dial, requestURL, headers, serverStatic, logger, buildNegotiate(maxFrame))
+func connectTunnelNegotiate(ctx context.Context, dial DialFunc, requestURL *url.URL, headers http.Header, serverStatic []byte, logger log.ContextLogger, maxFrame uint32, axes ...tunnelAxes) (*Tunnel, error) {
+	return connectTunnelOffer(ctx, dial, requestURL, headers, serverStatic, logger, buildNegotiate(maxFrame), axes...)
+}
+
+// firstTunnelAxes folds the variadic axes into one value (zero when absent).
+func firstTunnelAxes(axes []tunnelAxes) tunnelAxes {
+	if len(axes) > 0 {
+		return axes[0]
+	}
+	return tunnelAxes{}
 }
 
 // connectTunnelOffer is the shared connectTunnel body; offer carries a
 // prebuilt NEGOTIATE frame (nil = no negotiation).
-func connectTunnelOffer(ctx context.Context, dial DialFunc, requestURL *url.URL, headers http.Header, serverStatic []byte, logger log.ContextLogger, offer []byte) (*Tunnel, error) {
+func connectTunnelOffer(ctx context.Context, dial DialFunc, requestURL *url.URL, headers http.Header, serverStatic []byte, logger log.ContextLogger, offer []byte, axes ...tunnelAxes) (*Tunnel, error) {
+	ax := firstTunnelAxes(axes)
 	ctx, cancel := context.WithTimeout(ctx, handshakeTimeout)
 	defer cancel()
 
@@ -450,7 +465,7 @@ func connectTunnelOffer(ctx context.Context, dial DialFunc, requestURL *url.URL,
 	inner = append(inner, Magic[:]...)
 	inner = append(inner, ephPub...)
 	hello := salt
-	hello = append(hello, sealCtr(helloCipher, 0, inner)...)
+	hello = append(hello, sealCtrFor(helloCipher, 0, inner, ax.pad)...)
 	helloFrame := binary.BigEndian.AppendUint32(nil, uint32(len(hello)))
 	helloFrame = append(helloFrame, hello...)
 
@@ -512,6 +527,7 @@ func connectTunnelOffer(ctx context.Context, dial DialFunc, requestURL *url.URL,
 		raw:      raw,
 		ws:       wsConn,
 		aead:     cipher,
+		padCfg:   ax.pad,
 		out:      make(chan []byte, chanSize),
 		done:     make(chan struct{}),
 		logger:   logger,
@@ -530,14 +546,20 @@ func connectTunnelOffer(ctx context.Context, dial DialFunc, requestURL *url.URL,
 	return tunnel, nil
 }
 
-// buildTLSConfigAndDialer builds the optional TLS fronting dialer.
-func buildTLSConfigAndDialer(ctx context.Context, logger log.ContextLogger, baseDialer N.Dialer, serverAddr M.Socksaddr, tlsOptions *option.OutboundTLSOptions) (N.Dialer, error) {
+// buildTLSConfigAndDialer builds the optional TLS fronting dialer. split
+// carries the candidate's ClientHello fragmentation/disorder axes (zero =
+// the historical defaults); the splitter sits INSIDE the TLS dialer so the
+// handshake runs over the fragmenting conn and the ClientHello itself is
+// split on the wire.
+func buildTLSConfigAndDialer(ctx context.Context, logger log.ContextLogger, baseDialer N.Dialer, serverAddr M.Socksaddr, tlsOptions *option.OutboundTLSOptions, split SplitParams) (N.Dialer, error) {
 	if tlsOptions == nil || !tlsOptions.Enabled {
 		return baseDialer, nil
 	}
 	// Mirror the Rust client: rustls is pinned to TLS 1.3 and certificate
 	// verification is always skipped. Server authentication is the
-	// pubkey-bound CONFIRM frame, so TLS is pure camouflage.
+	// pubkey-bound CONFIRM frame, so TLS is pure camouflage. Catalogued
+	// tls_min_version/tls_max_version/tls_alpn axes override these defaults
+	// (JA3-surface variants); an empty axis keeps the current config.
 	tlsOptions.Insecure = true
 	if tlsOptions.MinVersion == "" {
 		tlsOptions.MinVersion = "1.3"
@@ -552,8 +574,11 @@ func buildTLSConfigAndDialer(ctx context.Context, logger log.ContextLogger, base
 	if len(tlsConfig.NextProtos()) == 0 {
 		tlsConfig.SetNextProtos([]string{"http/1.1"})
 	}
-	// Fragment the ClientHello on the wire (NoDPI-style): the relay SNI is
-	// deliberately non-whitelisted, so the first record must not arrive as a
-	// single inspectable TLS record.
-	return splitDialer{Dialer: tls.NewDialer(baseDialer, tlsConfig)}, nil
+	// Fragment the first TLS flight on the wire (NoDPI-style): the relay SNI
+	// is deliberately non-whitelisted, so the first record must not arrive as
+	// a single inspectable TLS record. The splitter wraps the RAW dialer, not
+	// the finished TLS conn — the default TLS dialer handshakes eagerly
+	// inside DialContext, so a splitter wrapped around the result would never
+	// see the ClientHello write.
+	return tls.NewDialer(splitDialer{Dialer: baseDialer, Params: split}, tlsConfig), nil
 }
