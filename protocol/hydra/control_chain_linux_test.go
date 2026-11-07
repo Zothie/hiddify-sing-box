@@ -130,12 +130,21 @@ func TestExternalControlChain(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The 30 s recovery mandate is enforced at config build: an epoch is
+	// len(candidates) x AttemptTimeout, so the attempt timeout derives from
+	// the catalogue size instead of a fixed 15 s (5-candidate multi-axis
+	// catalogues otherwise fail closed). Floor 2 s keeps slow handshakes
+	// viable on small catalogues; the stand proof is well under 1 s.
+	attemptTimeout := (30 * time.Second) / time.Duration(len(candidates))
+	if attemptTimeout < 2*time.Second {
+		attemptTimeout = 2 * time.Second
+	}
 	options := &option.HydraAdaptiveOptions{
 		PhysicalInterface: os.Getenv("HYDRA_CHAIN_INTERFACE"),
 		Candidates:        candidates,
 		ProofURL:          proof.URL,
 		ProofBytes:        proof.Bytes,
-		AttemptTimeout:    badoption.Duration(15 * time.Second),
+		AttemptTimeout:    badoption.Duration(attemptTimeout),
 		Backoff:           badoption.Duration(time.Second),
 		MaxBackoff:        badoption.Duration(5 * time.Second),
 		StatePath:         os.Getenv("HYDRA_CHAIN_STATE_PATH"),
