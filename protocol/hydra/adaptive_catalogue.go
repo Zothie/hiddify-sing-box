@@ -9,6 +9,7 @@ import (
 	"math"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/sagernet/sing-box/option"
 )
@@ -600,4 +601,54 @@ func validateCatalogueEndpoint(recipeID string, ep CatalogueEndpoint) error {
 		return fmt.Errorf("hydra: catalogue expansion: recipe %q: endpoint %s:%d%s: path must start with '/'", recipeID, ep.Host, ep.Port, ep.Path)
 	}
 	return nil
+}
+
+// DefaultRecoveryBudget is the production worst-case recovery-epoch bound
+// (option.HydraAdaptiveOptions.RecoveryBudget's default): a verified stable
+// connection must be restored within 30 s of a tunnel loss whenever an
+// allowed recipe works anywhere in the first epoch order.
+const DefaultRecoveryBudget = 30 * time.Second
+
+// CatalogueBudgetError rejects a catalogue whose EXPANSION OUTPUT (every
+// matching endpoint of every recipe) cannot be swept inside the recovery
+// budget: candidates × attempt timeout exceeds it. The expansion is
+// fail-closed (audit G5, user mandate: no silent degradation) — the caller
+// keeps its current candidate set. To accept such a catalogue, the producer
+// must split it into smaller groups or the caller must raise the budget
+// explicitly; truncation is deliberately not offered.
+type CatalogueBudgetError struct {
+	Seq            uint64
+	Candidates     int
+	AttemptTimeout time.Duration
+	Budget         time.Duration
+}
+
+func (e *CatalogueBudgetError) Error() string {
+	return fmt.Sprintf("hydra: catalogue seq %d over recovery budget: %d candidates x %s exceeds %s — split the catalogue groups or raise recovery_budget",
+		e.Seq, e.Candidates, e.AttemptTimeout, e.Budget)
+}
+
+// ExpandCatalogueCandidates expands a VERIFIED catalogue into adaptive
+// outbound candidates and enforces the recovery budget on the expansion
+// output (audit G5). Policy: hint-first recovery makes the budget a
+// worst-case epoch bound — the coordinator gives every candidate one
+// AttemptTimeout-bounded attempt per epoch, so a working candidate anywhere
+// in the first epoch order is verified within budget. budget <= 0 selects
+// DefaultRecoveryBudget. On any error (invalid material, budget exceeded)
+// both result lists are nil.
+func ExpandCatalogueCandidates(cat *Catalogue, asn string, attemptTimeout, budget time.Duration) ([]option.HydraAdaptiveCandidateOptions, []string, error) {
+	if attemptTimeout <= 0 {
+		return nil, nil, errors.New("hydra: catalogue expansion: attempt timeout must be positive")
+	}
+	if budget <= 0 {
+		budget = DefaultRecoveryBudget
+	}
+	candidates, skips, err := CandidatesFromCatalogue(cat, asn)
+	if err != nil {
+		return nil, nil, err
+	}
+	if need := attemptTimeout * time.Duration(len(candidates)); need > budget {
+		return nil, nil, &CatalogueBudgetError{Seq: cat.Seq, Candidates: len(candidates), AttemptTimeout: attemptTimeout, Budget: budget}
+	}
+	return candidates, skips, nil
 }

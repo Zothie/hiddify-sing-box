@@ -70,6 +70,18 @@ type Snapshot struct {
 	// PerCandidate holds attempts per candidate ID (populated in Snapshot;
 	// nil when nothing has been attempted yet). Prewarm attempts included.
 	PerCandidate map[string]uint64
+	// CandidateCount is the size of the CURRENT candidate set (computed at
+	// snapshot time). It changes when ReplaceCandidates hot-swaps the set.
+	CandidateCount int
+	// SwapGeneration increments only on ReplaceCandidates (catalogue-runtime
+	// hot swap). Unlike Generation it does NOT invalidate in-flight attempts.
+	SwapGeneration uint64
+	// DPI gate status is owned by the outbound layer (hydra dpigate.go),
+	// not by the coordinator: EnableDPIGate records the outcome and the
+	// state reporter merges it into the snapshot copy it surfaces. Zero
+	// values mean the gate has never been attempted in this process.
+	DPIGateEnabled bool
+	DPIGateReason  string
 }
 
 var ErrClosed = errors.New("adaptive coordinator closed")
@@ -271,6 +283,7 @@ func (c *Coordinator) Snapshot() Snapshot {
 	defer c.mu.Unlock()
 	s := c.state
 	s.TotalAttempts = s.Attempts
+	s.CandidateCount = len(c.cfg.Candidates)
 	if s.SearchInProgress {
 		s.SearchElapsed += time.Since(c.searchStarted)
 	}
@@ -430,6 +443,55 @@ func (c *Coordinator) ResetNetwork() {
 	case c.wake <- struct{}{}:
 	default:
 	}
+}
+
+// ReplaceCandidates atomically swaps the candidate set of a live coordinator
+// (catalogue-runtime hot swap, audit G2). The swap is one locked slice write:
+// the run loop, prewarm and scoring read cfg.Candidates only under mu, so
+// every attempt observes exactly one complete set — never a torn list. The
+// loop is woken by breaking any in-flight backoff wait (the same breaker
+// SetBlackout uses) so fresh candidates start immediately; a healthy active
+// tunnel is never interrupted.
+//
+// Deliberately NOT a generation bump: an in-flight attempt on a REMOVED id
+// may still complete and promote — a verified tunnel is a real resource.
+// Attempt/failure stats are id-keyed, so surviving ids keep their fairness
+// history. A LastGood that is no longer a member drops its in-memory
+// preference; the hint FILE is kept (a hint can never manufacture a
+// candidate, and loadHint rejects unknown ids).
+func (c *Coordinator) ReplaceCandidates(next []Candidate) error {
+	if len(next) == 0 {
+		return errors.New("adaptive: empty candidate set")
+	}
+	seen := make(map[string]bool, len(next))
+	for _, v := range next {
+		if v.ID == "" || seen[v.ID] {
+			return fmt.Errorf("invalid candidate ID %q", v.ID)
+		}
+		seen[v.ID] = true
+	}
+	copied := append([]Candidate(nil), next...)
+	c.mu.Lock()
+	if c.state.Closed || c.ctx.Err() != nil {
+		c.mu.Unlock()
+		return ErrClosed
+	}
+	c.cfg.Candidates = copied
+	// run() indexes cfg.Candidates[c.next] directly; a smaller set must
+	// leave the round-robin cursor in range.
+	if c.next >= len(copied) {
+		c.next %= len(copied)
+	}
+	if c.state.LastGood != "" && !seen[c.state.LastGood] {
+		c.state.LastGood = ""
+	}
+	c.state.SwapGeneration++
+	breakWait := c.blackoutCancel
+	c.mu.Unlock()
+	if breakWait != nil {
+		breakWait()
+	}
+	return nil
 }
 
 // prewarm builds and verifies one alternative candidate while current keeps

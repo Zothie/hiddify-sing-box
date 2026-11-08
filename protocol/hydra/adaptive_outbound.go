@@ -147,75 +147,19 @@ func newAdaptiveOutboundWithDependencies(ctx context.Context, router adapter.Rou
 	built := make(map[string]*Outbound)
 	endpoints := make(map[string]bool)
 	for _, v := range a.Candidates {
-		pubkey, maxFrame := v.Pubkey, v.NegotiateMaxFrame
-		if pubkey == "" {
-			pubkey = options.Pubkey
+		resolved, e := resolveAdaptiveCandidate(options, logger, v)
+		if e != nil {
+			return nil, e
 		}
-		if maxFrame == 0 && v.RecipeID == "" {
-			maxFrame = options.NegotiateMaxFrame
-		}
-		// Tuning axes resolve with parent fallback BEFORE identity hashing,
-		// so an alias candidate carrying zero axes on a tuned parent is
-		// recognized as the SAME effective configuration (no duplicate
-		// configs), while two variants differing in one axis stay distinct.
-		// Fail-closed on a malformed pad ladder (audit F10).
-		tuned, _, axErr := axesOrDefault(v, hydraParentAxes(options), logger)
-		if axErr != nil {
-			return nil, fmt.Errorf("hydra: candidate %q: %w", v.ID, axErr)
-		}
-		host := strings.ToLower(strings.TrimSuffix(v.Server, "."))
-		identity := tuned
-		identity.ID = ""
-		identity.RecipeID = ""
-		identity.Pubkey = pubkey
-		identity.NegotiateMaxFrame = maxFrame
-		identity.Server = host
-		identity.Transport = normalizeTransport(identity.Transport)
-		if identity.Transport != transportWSS && identity.Transport != transportRTC {
-			return nil, fmt.Errorf("hydra: candidate %q: unknown transport %q", v.ID, v.Transport)
-		}
-		if identity.Path == "" {
-			identity.Path = "/"
-		} else if !strings.HasPrefix(identity.Path, "/") {
-			identity.Path = "/" + identity.Path
-		}
-		encoded, marshalErr := json.Marshal(identity)
-		if marshalErr != nil {
-			return nil, marshalErr
-		}
-		endpoint := string(encoded)
-		if strings.TrimSpace(v.ID) == "" || built[v.ID] != nil || endpoints[endpoint] || host == "" || strings.ContainsAny(host, " /\\\t\n?#@") || v.ServerPort == 0 || v.Detour != "" {
+		if built[v.ID] != nil || endpoints[resolved.identity] {
 			return nil, fmt.Errorf("hydra: invalid candidate %q", v.ID)
 		}
-		if net.ParseIP(host) == nil {
-			for _, label := range strings.Split(host, ".") {
-				if label == "" || len(label) > 63 || strings.HasPrefix(label, "-") || strings.HasSuffix(label, "-") {
-					return nil, fmt.Errorf("hydra: invalid server")
-				}
-				for _, r := range label {
-					if !(r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '-') {
-						return nil, fmt.Errorf("hydra: invalid server")
-					}
-				}
-			}
-		}
-		// TLS surface axes (tls_fragment / versions / alpn) are applied onto
-		// a copy of the candidate TLS options; the resolved axis values live
-		// on the child's own passthrough fields (single source of truth).
-		tlsOptions := applyTLSAxes(v.TLS, tuned.TLSFragment, tuned.TLSMinVersion, tuned.TLSMaxVersion, tuned.TLSALPN)
-		base, e := factory(ctx, v)
+		child, e := buildResolvedCandidate(ctx, logger, tag, deps, factory, v, resolved)
 		if e != nil {
 			return nil, e
 		}
-		if base == nil {
-			return nil, fmt.Errorf("hydra: nil candidate dialer")
-		}
-		child, e := newStaticOutbound(ctx, logger, tag, option.HydraOutboundOptions{ServerOptions: v.ServerOptions, DialerOptions: v.DialerOptions, Pubkey: pubkey, Path: v.Path, TLS: tlsOptions, Transport: v.Transport, NegotiateMaxFrame: maxFrame, FragFirstMin: tuned.FragFirstMin, FragFirstMax: tuned.FragFirstMax, FragRestMin: tuned.FragRestMin, FragRestMax: tuned.FragRestMax, FragSplitDelayMs: tuned.FragSplitDelayMs, Disorder: tuned.Disorder, DisorderDelayMs: tuned.DisorderDelayMs, PadBuckets: tuned.PadBuckets, MaxPad: tuned.MaxPad, BigPadMax: tuned.BigPadMax, RTCChunk: tuned.RTCChunk, RTCWindow: tuned.RTCWindow, RTORtoMinMs: tuned.RTORtoMinMs, RTORtoMaxMs: tuned.RTORtoMaxMs, RTCBufferCap: tuned.RTCBufferCap, RTCKeepaliveEveryMs: tuned.RTCKeepaliveEveryMs, TLSFragment: tuned.TLSFragment, TLSMinVersion: tuned.TLSMinVersion, TLSMaxVersion: tuned.TLSMaxVersion, TLSALPN: tuned.TLSALPN}, base)
-		if e != nil {
-			return nil, e
-		}
-		built[v.ID] = child.(*Outbound)
-		endpoints[endpoint] = true
+		built[v.ID] = child
+		endpoints[resolved.identity] = true
 		candidates = append(candidates, adaptive.Candidate{ID: v.ID})
 	}
 	// Each candidate owns its transport. No candidate is dialed until Acquire.
@@ -242,6 +186,11 @@ func newAdaptiveOutboundWithDependencies(ctx context.Context, router adapter.Rou
 	// probe; all-fail means the internet itself is dead.
 	var coordinator *adaptive.Coordinator
 	var watcher *blackoutWatcher
+	// childrenMu guards the candidate child pool against the catalogue hot
+	// swap (audit G2): the coordinator's Connect reads the pool on the sweep
+	// loop, the swap mutates it after commit. Construction never overlaps a
+	// swap (the swap target is registered only after construction).
+	var childrenMu sync.Mutex
 	if len(referenceURLs) > 0 {
 		watcher = newBlackoutWatcher(len(a.Candidates), referenceURLs, proofTLS,
 			func(probeCtx context.Context) (N.Dialer, error) {
@@ -258,7 +207,15 @@ func newAdaptiveOutboundWithDependencies(ctx context.Context, router adapter.Rou
 	}
 	c, err := adaptive.New(ctx, adaptive.Config{StatePath: a.StatePath, StateKey: stateKey, Candidates: candidates, AttemptTimeout: attempt, Backoff: backoff, MaxBackoff: max, BlackoutRecheck: blackoutRecheck,
 		Connect: func(ctx context.Context, v adaptive.Candidate) (adaptive.Resource, error) {
+			childrenMu.Lock()
 			b := built[v.ID]
+			childrenMu.Unlock()
+			if b == nil {
+				// A hot swap removed this candidate while its last attempt
+				// was still queued; the coordinator treats the attempt as
+				// failed and moves on.
+				return nil, fmt.Errorf("hydra: adaptive candidate %q no longer in the pool", v.ID)
+			}
 			var resource adaptive.Resource
 			var err error
 			if b.rtcTransport {
@@ -296,6 +253,110 @@ func newAdaptiveOutboundWithDependencies(ctx context.Context, router adapter.Rou
 	}
 	coordinator = c
 	o.adaptive = c
+	// Catalogue-runtime hot swap (audit G2). The target goes live only after
+	// the coordinator exists; a re-constructed outbound replaces the
+	// previous entry for the same tag. The closure re-validates everything
+	// at the commit point — identity resolution, dedup inside the final set
+	// and the recovery budget (G5) — and fails closed: a rejected swap
+	// leaves the current set untouched and serving.
+	registerCatalogueSwap(SwapTarget{
+		Tag:            tag,
+		Pubkey:         options.Pubkey,
+		ASN:            a.CatalogueASN,
+		AttemptTimeout: attempt,
+		Budget:         budget,
+		alive: func() bool {
+			o.mu.Lock()
+			defer o.mu.Unlock()
+			return !o.isClosed
+		},
+		Swap: func(next []option.HydraAdaptiveCandidateOptions) error {
+			o.mu.Lock()
+			closed := o.isClosed
+			o.mu.Unlock()
+			if closed {
+				// Lazy unregister: Close lives in outbound.go and must stay
+				// untouched; the first post-close swap cleans the registry.
+				unregisterCatalogueSwap(tag)
+				return fmt.Errorf("hydra: catalogue swap %q: outbound closed", tag)
+			}
+			if len(next) == 0 {
+				return fmt.Errorf("hydra: catalogue swap %q: empty candidate set", tag)
+			}
+			if need := attempt * time.Duration(len(next)); need > budget {
+				return fmt.Errorf("hydra: catalogue swap %q: %d candidates x %s exceeds recovery budget %s", tag, len(next), attempt, budget)
+			}
+			// Build the final set's children view OUTSIDE the pool lock:
+			// the dialer factory is the slow part. Surviving ids reuse the
+			// pooled child (and their stats/fairness history); new ids build
+			// fresh children.
+			final := make(map[string]*Outbound, len(next))
+			identities := make(map[string]bool, len(next))
+			for _, v := range next {
+				resolved, rerr := resolveAdaptiveCandidate(options, logger, v)
+				if rerr != nil {
+					return fmt.Errorf("hydra: catalogue swap %q: %w", tag, rerr)
+				}
+				if identities[resolved.identity] {
+					return fmt.Errorf("hydra: catalogue swap %q: candidate %q duplicates an effective configuration", tag, v.ID)
+				}
+				identities[resolved.identity] = true
+				childrenMu.Lock()
+				child := built[v.ID]
+				childrenMu.Unlock()
+				if child == nil {
+					builtChild, berr := buildResolvedCandidate(ctx, logger, tag, deps, factory, v, resolved)
+					if berr != nil {
+						return fmt.Errorf("hydra: catalogue swap %q: %w", tag, berr)
+					}
+					child = builtChild
+				}
+				final[v.ID] = child
+			}
+			// Read the active id BEFORE taking the pool lock (Snapshot takes
+			// the coordinator lock; the sweep loop's Connect takes the pool
+			// lock without the coordinator lock, so the order avoids a
+			// cycle). A promote landing in the remaining window is safe:
+			// closing a child never closes its dialer, so even the active
+			// tunnel keeps working; the exception just keeps the pool entry
+			// available.
+			active := c.Snapshot().ActiveID
+			childrenMu.Lock()
+			defer childrenMu.Unlock()
+			ids := make([]adaptive.Candidate, 0, len(next))
+			for _, v := range next {
+				ids = append(ids, adaptive.Candidate{ID: v.ID})
+			}
+			if err := c.ReplaceCandidates(ids); err != nil {
+				return err
+			}
+			for id, child := range final {
+				if built[id] == nil {
+					built[id] = child
+				}
+			}
+			// Amendment 4: bound the child pool — replaced children are
+			// closed and dropped except the active tunnel's child (an
+			// in-flight connect on a closed dialer fails naturally; a live
+			// tunnel keeps serving). In Go a map entry can be deleted while
+			// ranging.
+			for id, child := range built {
+				if _, keep := final[id]; !keep && id != active {
+					_ = child.Close()
+					delete(built, id)
+				}
+			}
+			// Children share the parent's tag, and Outbound.Close
+			// unregisters the ADAPTIVE registry under that tag — the prune
+			// above would silently drop the PARENT's snapshot entry. Restore
+			// it (the parent stays open; its entry must outlive this swap).
+			adaptive.RegisterOutbound(tag, o.adaptiveSnapshot)
+			// The blackout dead-epoch must mean a full epoch of the CURRENT
+			// set, not the construction-time one.
+			watcher.setEpochSize(len(next))
+			return nil
+		},
+	})
 	if coverage != nil {
 		o.coverage = coverage
 		// While the active tunnel is below full coverage, the sweep driver
@@ -306,6 +367,102 @@ func newAdaptiveOutboundWithDependencies(ctx context.Context, router adapter.Rou
 	}
 	adaptive.RegisterOutbound(tag, o.adaptiveSnapshot)
 	return o, nil
+}
+
+// resolvedCandidate is one adaptive candidate's resolved construction
+// material, shared by construction and the catalogue hot swap.
+type resolvedCandidate struct {
+	// identity is the effective-config JSON of the normalized candidate; it
+	// must stay unique across a candidate set (two variants differing only
+	// in one axis are distinct, an alias with zero axes on a tuned parent
+	// collapses onto the parent).
+	identity string
+	pubkey   string
+	maxFrame uint32
+	tuned    option.HydraAdaptiveCandidateOptions
+}
+
+// resolveAdaptiveCandidate validates one adaptive candidate against the
+// parent options and computes its effective identity. Construction and the
+// catalogue hot swap share this path so a swapped candidate obeys every
+// construction rule: pubkey/maxframe parent fallback, axes resolution with
+// parent fallback (fail-closed on a malformed pad ladder, audit F10),
+// transport/path normalization and host checks.
+func resolveAdaptiveCandidate(options option.HydraOutboundOptions, logger log.ContextLogger, v option.HydraAdaptiveCandidateOptions) (resolvedCandidate, error) {
+	var resolved resolvedCandidate
+	resolved.pubkey, resolved.maxFrame = v.Pubkey, v.NegotiateMaxFrame
+	if resolved.pubkey == "" {
+		resolved.pubkey = options.Pubkey
+	}
+	if resolved.maxFrame == 0 && v.RecipeID == "" {
+		resolved.maxFrame = options.NegotiateMaxFrame
+	}
+	tuned, _, axErr := axesOrDefault(v, hydraParentAxes(options), logger)
+	if axErr != nil {
+		return resolved, fmt.Errorf("hydra: candidate %q: %w", v.ID, axErr)
+	}
+	resolved.tuned = tuned
+	host := strings.ToLower(strings.TrimSuffix(v.Server, "."))
+	identity := tuned
+	identity.ID = ""
+	identity.RecipeID = ""
+	identity.Pubkey = resolved.pubkey
+	identity.NegotiateMaxFrame = resolved.maxFrame
+	identity.Server = host
+	identity.Transport = normalizeTransport(identity.Transport)
+	if identity.Transport != transportWSS && identity.Transport != transportRTC {
+		return resolved, fmt.Errorf("hydra: candidate %q: unknown transport %q", v.ID, v.Transport)
+	}
+	if identity.Path == "" {
+		identity.Path = "/"
+	} else if !strings.HasPrefix(identity.Path, "/") {
+		identity.Path = "/" + identity.Path
+	}
+	encoded, marshalErr := json.Marshal(identity)
+	if marshalErr != nil {
+		return resolved, marshalErr
+	}
+	resolved.identity = string(encoded)
+	if strings.TrimSpace(v.ID) == "" || host == "" || strings.ContainsAny(host, " /\\\t\n?#@") || v.ServerPort == 0 || v.Detour != "" {
+		return resolved, fmt.Errorf("hydra: invalid candidate %q", v.ID)
+	}
+	if net.ParseIP(host) == nil {
+		for _, label := range strings.Split(host, ".") {
+			if label == "" || len(label) > 63 || strings.HasPrefix(label, "-") || strings.HasSuffix(label, "-") {
+				return resolved, fmt.Errorf("hydra: invalid server")
+			}
+			for _, r := range label {
+				if !(r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '-') {
+					return resolved, fmt.Errorf("hydra: invalid server")
+				}
+			}
+		}
+	}
+	return resolved, nil
+}
+
+// buildResolvedCandidate builds the child outbound for an ALREADY-resolved
+// candidate (resolveAdaptiveCandidate). Split from resolution so callers
+// reject duplicate ids/identities BEFORE any dialer is built — a duplicate
+// must not consume a dialer from the factory.
+func buildResolvedCandidate(ctx context.Context, logger log.ContextLogger, tag string, deps adaptiveOutboundDependencies, factory func(context.Context, option.HydraAdaptiveCandidateOptions) (N.Dialer, error), v option.HydraAdaptiveCandidateOptions, resolved resolvedCandidate) (*Outbound, error) {
+	// TLS surface axes (tls_fragment / versions / alpn) are applied onto
+	// a copy of the candidate TLS options; the resolved axis values live
+	// on the child's own passthrough fields (single source of truth).
+	tlsOptions := applyTLSAxes(v.TLS, resolved.tuned.TLSFragment, resolved.tuned.TLSMinVersion, resolved.tuned.TLSMaxVersion, resolved.tuned.TLSALPN)
+	base, e := factory(ctx, v)
+	if e != nil {
+		return nil, e
+	}
+	if base == nil {
+		return nil, fmt.Errorf("hydra: nil candidate dialer")
+	}
+	t := resolved.tuned
+	child, e := newStaticOutbound(ctx, logger, tag, option.HydraOutboundOptions{ServerOptions: v.ServerOptions, DialerOptions: v.DialerOptions, Pubkey: resolved.pubkey, Path: v.Path, TLS: tlsOptions, Transport: v.Transport, NegotiateMaxFrame: resolved.maxFrame, FragFirstMin: t.FragFirstMin, FragFirstMax: t.FragFirstMax, FragRestMin: t.FragRestMin, FragRestMax: t.FragRestMax, FragSplitDelayMs: t.FragSplitDelayMs, Disorder: t.Disorder, DisorderDelayMs: t.DisorderDelayMs, PadBuckets: t.PadBuckets, MaxPad: t.MaxPad, BigPadMax: t.BigPadMax, RTCChunk: t.RTCChunk, RTCWindow: t.RTCWindow, RTORtoMinMs: t.RTORtoMinMs, RTORtoMaxMs: t.RTORtoMaxMs, RTCBufferCap: t.RTCBufferCap, RTCKeepaliveEveryMs: t.RTCKeepaliveEveryMs, TLSFragment: t.TLSFragment, TLSMinVersion: t.TLSMinVersion, TLSMaxVersion: t.TLSMaxVersion, TLSALPN: t.TLSALPN}, base)
+	if e != nil {
+		return nil, e
+	}
+	return child.(*Outbound), nil
 }
 
 func (o *Outbound) adaptiveSnapshot() adaptive.Snapshot {
@@ -419,6 +576,18 @@ func (w *blackoutWatcher) reset() {
 	}
 	w.mu.Lock()
 	w.consecutive = 0
+	w.mu.Unlock()
+}
+
+// setEpochSize updates the dead-epoch size after a candidate hot swap so a
+// blackout probe still fires after exactly one full epoch of the CURRENT
+// candidate set (a swap can grow or shrink it).
+func (w *blackoutWatcher) setEpochSize(n int) {
+	if w == nil || n <= 0 {
+		return
+	}
+	w.mu.Lock()
+	w.epochSize = n
 	w.mu.Unlock()
 }
 

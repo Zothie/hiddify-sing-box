@@ -545,6 +545,27 @@ type ClientSelfGate struct {
 	lastProb float32
 }
 
+// Gate-state record for the adaptive snapshot: the process-wide outcome of
+// the most recent EnableDPIGate call. The coordinator never owns the gate —
+// the outbound layer does — so this is the seam the state reporter reads to
+// surface dpi_gate_enabled/dpi_gate_reason.
+var (
+	dpiGateStateMu     sync.RWMutex
+	dpiGateStateOn     bool
+	dpiGateStateReason string
+)
+
+// GateState reports the client self-check gate status recorded at the most
+// recent EnableDPIGate call: enabled is true when the gate is live and
+// reason is then empty; otherwise reason carries the failure that kept the
+// gate off (fail-to-off diagnostics). Before any EnableDPIGate call both
+// are zero.
+func GateState() (enabled bool, reason string) {
+	dpiGateStateMu.RLock()
+	defer dpiGateStateMu.RUnlock()
+	return dpiGateStateOn, dpiGateStateReason
+}
+
 // EnableDPIGate builds the client self-check gate at the given threshold.
 // FAIL-TO-OFF: any embedded-model digest mismatch or malformed blob returns
 // an error and the caller must keep running ungated (the historical,
@@ -552,8 +573,14 @@ type ClientSelfGate struct {
 func EnableDPIGate(threshold float32) (*ClientSelfGate, error) {
 	m, err := loadDPIGateModel()
 	if err != nil {
+		dpiGateStateMu.Lock()
+		dpiGateStateOn, dpiGateStateReason = false, err.Error()
+		dpiGateStateMu.Unlock()
 		return nil, err
 	}
+	dpiGateStateMu.Lock()
+	dpiGateStateOn, dpiGateStateReason = true, ""
+	dpiGateStateMu.Unlock()
 	return &ClientSelfGate{
 		gate:            newDPIGate(m, threshold),
 		stride:          DPIGateDefaultStride,

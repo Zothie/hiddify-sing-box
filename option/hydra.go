@@ -106,6 +106,12 @@ type HydraAdaptiveOptions struct {
 	// connection restored within 30 s of a tunnel timeout whenever an
 	// allowed recipe works and sits anywhere in the first epoch order.
 	RecoveryBudget badoption.Duration `json:"recovery_budget,omitempty"`
+	// CatalogueASN orders catalogue recipe expansion for THIS group: recipes
+	// hinted for the ASN (decimal AS number, from the asn= link param) expand
+	// first so hint-first recovery sweeps the likely-working recipes first.
+	// Empty (default) expands in document order. Advisory only — every
+	// candidate still passes the runtime's own proof before use.
+	CatalogueASN string `json:"catalogue_asn,omitempty"`
 	// ReferenceURLs lists up to three https origins that decide blackout:
 	// after a full candidate epoch where no attempt reached a handshake, one
 	// bounded HTTPS GET per reference runs through the physical dialer; when
@@ -178,6 +184,11 @@ type HydraOutboundOptions struct {
 	AdaptiveInterface string `json:"adaptive_interface,omitempty"`
 	// AdaptiveDNS lists the physical-layer resolvers (ip:port, max 8).
 	AdaptiveDNS []string `json:"adaptive_dns,omitempty"`
+	// AdaptiveASN is the provider ASN hint carried by the asn= link param.
+	// On a merged adaptive group it becomes HydraAdaptiveOptions.CatalogueASN
+	// (catalogue recipe hint ordering); it is an ordering hint only, never
+	// security. Stripped with the other plumbing on non-adaptive paths.
+	AdaptiveASN string `json:"adaptive_asn,omitempty"`
 	// Transport is this link's wire transport ("wss", default, or "rtc").
 	// For grouped links it is carried onto the candidate; a static (solo)
 	// outbound keeps it on itself.
