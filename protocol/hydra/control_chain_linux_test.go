@@ -18,9 +18,18 @@ import (
 
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
+	"github.com/sagernet/sing-box/protocol/hydra/adaptive"
 	"github.com/sagernet/sing-box/protocol/hydra/controlclient"
 	"github.com/sagernet/sing/common/json/badoption"
 )
+
+// mergeGateState folds the process-wide dpi-gate record into a coordinator
+// snapshot: the gate state lives in the outbound layer (GateState), not in
+// the coordinator, so raw snapshots underreport it.
+func mergeGateState(s adaptive.Snapshot) adaptive.Snapshot {
+	s.DPIGateEnabled, s.DPIGateReason = GateState()
+	return s
+}
 
 // TestExternalControlChain uses the production adaptive outbound, including its
 // physical dialer, TLS fronting, negotiation and useful-byte verification.
@@ -185,7 +194,7 @@ func TestExternalControlChain(t *testing.T) {
 			stableFor = time.Since(stableStarted)
 		}
 		report, _ := json.Marshal(map[string]any{
-			"snapshot":   o.adaptiveSnapshot(),
+			"snapshot":   mergeGateState(o.adaptiveSnapshot()),
 			"candidates": len(candidates), "skips": skips,
 			"first_verified_ms":     firstReady.Milliseconds(),
 			"control_ms":            controlElapsed.Milliseconds(),
@@ -232,7 +241,10 @@ func TestExternalControlChain(t *testing.T) {
 		}
 		// Periodic snapshot: intermediate counters turn flatness/coverage
 		// claims into evidence instead of final-state inference.
-		snap, _ := json.Marshal(map[string]any{"t": time.Since(stableStarted).Milliseconds(), "snap": o.adaptiveSnapshot()})
+		snapMap := map[string]any{"t": time.Since(stableStarted).Milliseconds()}
+		full := mergeGateState(o.adaptiveSnapshot())
+		snapMap["snap"] = full
+		snap, _ := json.Marshal(snapMap)
 		fmt.Println("HYDRA_SOAK_SNAPSHOT " + string(snap))
 		if err = verifyTunnelProof(ctx, tunnel, proof); err != nil {
 			t.Fatalf("stability useful proof: %v", err)
