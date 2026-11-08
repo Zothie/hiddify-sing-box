@@ -222,9 +222,18 @@ func TestExternalControlChain(t *testing.T) {
 			t.Fatal(ctx.Err())
 		case <-tunnel.Done():
 			timer.Stop()
-			t.Fatal("promoted tunnel died during stability observation")
+			// Death WITHOUT a logged cause is an audit hole: surface the
+			// exact kill reason (read/write error, server close, stall).
+			if cause := tunnel.DeathCause(); cause != nil {
+				t.Fatalf("promoted tunnel died during stability observation: %v", cause)
+			}
+			t.Fatal("promoted tunnel died during stability observation (clean close)")
 		case <-timer.C:
 		}
+		// Periodic snapshot: intermediate counters turn flatness/coverage
+		// claims into evidence instead of final-state inference.
+		snap, _ := json.Marshal(map[string]any{"t": time.Since(stableStarted).Milliseconds(), "snap": o.adaptiveSnapshot()})
+		fmt.Println("HYDRA_SOAK_SNAPSHOT " + string(snap))
 		if err = verifyTunnelProof(ctx, tunnel, proof); err != nil {
 			t.Fatalf("stability useful proof: %v", err)
 		}

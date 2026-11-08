@@ -89,6 +89,9 @@ type Tunnel struct {
 	mu       sync.Mutex
 	sessions map[[IDSize]byte]*session
 	udp      map[[IDSize]byte]*udpSession
+	// deathCause records why kill() fired (nil for a clean Close); read
+	// through DeathCause after Done, written only inside deadOnce.
+	deathCause error
 }
 
 // IsDead reports whether the tunnel is dead and needs a rebuild.
@@ -110,11 +113,23 @@ func (t *Tunnel) Close() error {
 	return nil
 }
 
+// DeathCause returns the error that killed the tunnel (nil for a clean
+// Close or an unobserved death). Diagnostic seam for supervisors that
+// need the why, not just the fact, of a tunnel death.
+func (t *Tunnel) DeathCause() error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.deathCause
+}
+
 func (t *Tunnel) kill(cause error) {
 	t.deadOnce.Do(func() {
 		if cause != nil && t.logger != nil {
 			t.logger.Trace("hydra tunnel died: ", cause)
 		}
+		t.mu.Lock()
+		t.deathCause = cause
+		t.mu.Unlock()
 		close(t.done)
 		// Unblocks the reader (read error) and any stalled write
 		// (AfterFunc-based write stall uses the same path).
