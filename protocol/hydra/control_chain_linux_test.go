@@ -159,6 +159,17 @@ func TestExternalControlChain(t *testing.T) {
 	if dns := os.Getenv("HYDRA_CHAIN_DNS"); dns != "" {
 		options.PhysicalDNSServers = strings.Split(dns, ",")
 	}
+	// Stand-level blackout/coverage exercises (audit G6): the harness env
+	// feeds the same options the production config builder would. Blackout:
+	// the origin kill flips the gate after a dead epoch. Coverage: the
+	// probes ride the active tunnel and the reported percent lands in the
+	// snapshot of the final HYDRA_CONTROL_CHAIN line.
+	if refs := os.Getenv("HYDRA_CHAIN_REFERENCE_URLS"); refs != "" {
+		options.ReferenceURLs = strings.Split(refs, ",")
+	}
+	if cov := os.Getenv("HYDRA_CHAIN_COVERAGE_URLS"); cov != "" {
+		options.CoverageProbeURLs = strings.Split(cov, ",")
+	}
 	built, err := newAdaptiveOutboundWithDependencies(ctx, nil, factory.Logger(), "external-control-chain", option.HydraOutboundOptions{Adaptive: options}, adaptiveOutboundDependencies{ProofTLS: proof.TLS})
 	if err != nil {
 		t.Fatalf("production outbound rejected: %v", err)
