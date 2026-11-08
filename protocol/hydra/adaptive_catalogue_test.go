@@ -628,12 +628,16 @@ func TestCatalogueExpansionAttackCheckGuard(t *testing.T) {
 }
 
 func TestCatalogueExpansionDPIGateAxes(t *testing.T) {
-	// dpi_gate with no threshold bakes the Rust default 0.5; explicit 0 is
-	// the deliberate raise-on-everything value and stays 0.
+	// dpi_gate is an RTC-pump axis (Rust parity: run_rtc_pump is the only
+	// gated site) — the test catalogue recipes must therefore be rtc, or
+	// the expansion reports dpi_gate-requires-rtc instead of expanding.
 	byThreshold := func(params map[string]any) option.HydraAdaptiveCandidateOptions {
-		cands, _, err := CandidatesFromCatalogue(axisCatalogue(params), "")
-		if err != nil || len(cands) != 1 {
-			t.Fatalf("params %v: candidates=%v err=%v, want one candidate", params, cands, err)
+		cat := axisCatalogue(params)
+		cat.Recipes[0].Transport = "rtc"
+		cat.Servers[0].Endpoints[0].Transport = "rtc"
+		cands, skips, err := CandidatesFromCatalogue(cat, "")
+		if err != nil || len(cands) != 1 || len(skips) != 0 {
+			t.Fatalf("params %v: candidates=%v skips=%v err=%v, want one candidate", params, cands, skips, err)
 		}
 		return cands[0]
 	}
@@ -652,6 +656,12 @@ func TestCatalogueExpansionDPIGateAxes(t *testing.T) {
 	off := byThreshold(nil)
 	if off.DPIGateEnabled {
 		t.Fatal("gate must default off")
+	}
+	// dpi_gate on a non-rtc recipe would silently arm nothing — it is an
+	// explicit skip (sibling survival), never a misleading candidate.
+	_, skips, err := CandidatesFromCatalogue(axisCatalogue(map[string]any{"dpi_gate": float64(1)}), "")
+	if err != nil || len(skips) != 1 || !strings.Contains(skips[0], "dpi_gate-requires-rtc") {
+		t.Fatalf("wss dpi_gate: skips=%v err=%v, want dpi_gate-requires-rtc skip", skips, err)
 	}
 	// Out-of-domain thresholds fail closed.
 	for _, bad := range []float64{-0.1, 1.5} {

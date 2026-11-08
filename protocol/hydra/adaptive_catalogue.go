@@ -92,6 +92,14 @@ func CandidatesFromCatalogue(cat *Catalogue, asn string) ([]option.HydraAdaptive
 			}
 			return nil, nil, fmt.Errorf("hydra: recipe %q: %w", rec.ID, axErr)
 		}
+		if axes.dpiGate && rec.Transport != "rtc" {
+			// The ClientSelfGate samples the RTC pump only (Rust parity:
+			// run_rtc_pump is the sole gated site). A dpi_gate axis on a
+			// non-rtc recipe would silently arm nothing — report it as an
+			// unsupported combination instead of a misleading candidate.
+			skips = append(skips, fmt.Sprintf("recipe %s: dpi_gate-requires-rtc", rec.ID))
+			continue
+		}
 		maxFrame, validFrame := RecipeMaxFrame(cat, rec.ID)
 		if _, present := rec.Params["max_frame"]; present && !validFrame {
 			return nil, nil, fmt.Errorf("hydra: recipe %q: invalid max_frame", rec.ID)
