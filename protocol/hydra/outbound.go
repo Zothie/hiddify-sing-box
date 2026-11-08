@@ -136,7 +136,7 @@ func newStaticOutbound(ctx context.Context, logger log.ContextLogger, tag string
 		// TLS surface axes (fragment / version / ALPN) ride the child's TLS
 		// options; applied onto a copy so the caller's config is never
 		// mutated (the builder reuses options across candidates).
-		tlsOptions := applyTLSAxes(options.TLS, options.TLSFragment, options.TLSMinVersion, options.TLSMaxVersion, options.TLSALPN)
+		tlsOptions := applyTLSAxes(options.TLS, options.TLSFragment, options.TLSMinVersion, options.TLSMaxVersion, options.TLSALPN, options.TLSFingerprint)
 		// Disorder (audit F2) arms the BASE dialer — the raw TCP socket below
 		// TLS — never the fragmenting conn.
 		baseDialer := N.Dialer(outboundDialer)
@@ -190,10 +190,14 @@ func newStaticOutbound(ctx context.Context, logger log.ContextLogger, tag string
 }
 
 // applyTLSAxes returns a copy of tlsOptions with the candidate's TLS surface
-// axes applied (tls_fragment / tls_min_version / tls_max_version / tls_alpn).
-// A nil or disabled TLS block ignores the axes (there is no TLS layer to
-// tune); empty axis values keep the current configuration.
-func applyTLSAxes(tlsOptions *option.OutboundTLSOptions, fragment bool, minVersion, maxVersion string, alpn []string) *option.OutboundTLSOptions {
+// axes applied (tls_fragment / tls_min_version / tls_max_version / tls_alpn /
+// tls_fingerprint). A nil or disabled TLS block ignores the axes (there is no
+// TLS layer to tune); empty axis values keep the current configuration. The
+// fingerprint selects the uTLS ClientHello (name already whitelist-validated
+// by resolveCandidateAxes); a real uTLS handshake additionally requires a
+// with_utls build — without the tag the dial fails loudly instead of
+// silently downgrading to the stdlib fingerprint.
+func applyTLSAxes(tlsOptions *option.OutboundTLSOptions, fragment bool, minVersion, maxVersion string, alpn []string, fingerprint string) *option.OutboundTLSOptions {
 	if tlsOptions == nil || !tlsOptions.Enabled {
 		return tlsOptions
 	}
@@ -209,6 +213,9 @@ func applyTLSAxes(tlsOptions *option.OutboundTLSOptions, fragment bool, minVersi
 	}
 	if len(alpn) > 0 {
 		copied.ALPN = alpn
+	}
+	if fingerprint != "" && copied.UTLS == nil {
+		copied.UTLS = &option.OutboundUTLSOptions{Enabled: true, Fingerprint: fingerprint}
 	}
 	return &copied
 }

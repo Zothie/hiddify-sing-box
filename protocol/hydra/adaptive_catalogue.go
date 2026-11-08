@@ -164,6 +164,8 @@ func CandidatesFromCatalogue(cat *Catalogue, asn string) ([]option.HydraAdaptive
 					TLSMinVersion:       axes.tlsMinVersion,
 					TLSMaxVersion:       axes.tlsMaxVersion,
 					TLSALPN:             axes.tlsALPN,
+					TLSFingerprint:      axes.tlsFingerprint,
+					HandshakeSpacingMs:  axes.spacingMs,
 					DPIGateEnabled:      axes.dpiGate,
 					DPIGateThreshold:    axes.dpiThreshold,
 				})
@@ -210,29 +212,31 @@ func RecipeMaxFrame(cat *Catalogue, recipeID string) (uint32, bool) {
 // scalars per the catalogue schema (number or string); list-shaped axes
 // (pad_buckets, tls_alpn) ride comma-separated strings.
 var catalogueAxisKeys = map[string]bool{
-	"max_frame":         true,
-	"frag_first_min":    true,
-	"frag_first_max":    true,
-	"frag_rest_min":     true,
-	"frag_rest_max":     true,
-	"split_delay_ms":    true,
-	"disorder":          true,
-	"disorder_delay_ms": true,
-	"pad_buckets":       true,
-	"max_pad":           true,
-	"big_pad_max":       true,
-	"rtc_chunk":         true,
-	"rtc_window":        true,
-	"rto_min":           true,
-	"rto_max":           true,
-	"buffer_cap":        true,
-	"keepalive_every":   true,
-	"tls_fragment":      true,
-	"tls_min_version":   true,
-	"tls_max_version":   true,
-	"tls_alpn":          true,
-	"dpi_gate":          true,
-	"dpi_threshold":     true,
+	"max_frame":            true,
+	"frag_first_min":       true,
+	"frag_first_max":       true,
+	"frag_rest_min":        true,
+	"frag_rest_max":        true,
+	"split_delay_ms":       true,
+	"disorder":             true,
+	"disorder_delay_ms":    true,
+	"pad_buckets":          true,
+	"max_pad":              true,
+	"big_pad_max":          true,
+	"rtc_chunk":            true,
+	"rtc_window":           true,
+	"rto_min":              true,
+	"rto_max":              true,
+	"buffer_cap":           true,
+	"keepalive_every":      true,
+	"tls_fragment":         true,
+	"tls_min_version":      true,
+	"tls_max_version":      true,
+	"tls_alpn":             true,
+	"tls_fingerprint":      true,
+	"handshake_spacing_ms": true,
+	"dpi_gate":             true,
+	"dpi_threshold":        true,
 }
 
 // recipeAxes is the parsed tuning-axis payload of one recipe's params.
@@ -250,6 +254,8 @@ type recipeAxes struct {
 	tlsFragment                  bool
 	tlsMinVersion, tlsMaxVersion string
 	tlsALPN                      []string
+	tlsFingerprint               string
+	spacingMs                    uint32
 	dpiGate                      bool
 	dpiThreshold                 float32
 }
@@ -269,6 +275,7 @@ const (
 	clampRTOMaxMinMs, clampRTOMaxMaxMs       = 1000, 10000
 	clampBufferCapMin, clampBufferCapMax     = 128, 2048
 	clampKeepaliveMinMs, clampKeepaliveMaxMs = 2000, 15000
+	clampSpacingMinMs, clampSpacingMaxMs     = 100, 60000
 )
 
 // Server-fatal frag-shape guard (measured against the real Rust server's
@@ -390,6 +397,18 @@ func parseRecipeAxes(params map[string]any) (recipeAxes, error) {
 		return ax, err
 	}
 	if ax.keepaliveEveryMs, err = u32("keepalive_every", clampKeepaliveMinMs, clampKeepaliveMaxMs); err != nil {
+		return ax, err
+	}
+	if ax.tlsFingerprint, err = strParam(params, "tls_fingerprint"); err != nil {
+		return ax, err
+	}
+	// Fail-closed: an unknown fingerprint name skips the recipe (the axis
+	// exists to control the on-wire ClientHello; a silent plain-TLS
+	// fallback would defeat it). Mirrors the runtime whitelist.
+	if err := validateTLSFingerprint(ax.tlsFingerprint); err != nil {
+		return ax, err
+	}
+	if ax.spacingMs, err = u32("handshake_spacing_ms", clampSpacingMinMs, clampSpacingMaxMs); err != nil {
 		return ax, err
 	}
 	if ax.tlsFragment, err = boolParam(params, "tls_fragment"); err != nil {

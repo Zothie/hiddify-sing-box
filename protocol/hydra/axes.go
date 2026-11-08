@@ -94,6 +94,12 @@ func resolvePadAxes(buckets []uint32, maxPadAxis, bigPadMaxAxis uint32) (*padCon
 // pad_buckets ladder fails construction (F10).
 func resolveCandidateAxes(o option.HydraAdaptiveCandidateOptions, logger log.ContextLogger) (tunnelAxes, error) {
 	axes := tunnelAxes{}
+	// tls_fingerprint is fail-closed: an unknown uTLS fingerprint name is a
+	// construction error, never a silent fall back to plain TLS (the whole
+	// point of the axis is the on-wire ClientHello shape).
+	if err := validateTLSFingerprint(o.TLSFingerprint); err != nil {
+		return axes, err
+	}
 	pad, err := resolvePadAxes(o.PadBuckets, o.MaxPad, o.BigPadMax)
 	if err != nil {
 		return axes, err
@@ -192,6 +198,12 @@ func axesOrDefault(candidate, parent option.HydraAdaptiveCandidateOptions, logge
 	}
 	if len(merged.TLSALPN) == 0 {
 		merged.TLSALPN = parent.TLSALPN
+	}
+	if merged.TLSFingerprint == "" {
+		merged.TLSFingerprint = parent.TLSFingerprint
+	}
+	if merged.HandshakeSpacingMs == 0 {
+		merged.HandshakeSpacingMs = parent.HandshakeSpacingMs
 	}
 	axes, err := resolveCandidateAxes(merged, logger)
 	return merged, axes, err

@@ -74,6 +74,20 @@ type HydraAdaptiveCandidateOptions struct {
 	TLSMinVersion string   `json:"tls_min_version,omitempty"`
 	TLSMaxVersion string   `json:"tls_max_version,omitempty"`
 	TLSALPN       []string `json:"tls_alpn,omitempty"`
+	// TLSFingerprint is the uTLS ClientHello fingerprint for the wss TLS
+	// handshake (chrome / firefox / edge / safari / ios / android / 360 /
+	// qq / random / randomized / chrome_psk* — the same vocabulary
+	// sing-box's utls layer supports). Empty = the standard crypto/tls
+	// handshake (unchanged default); an unknown name fails construction
+	// (fail-closed). Requires a build with the with_utls tag — without it
+	// the dial fails loudly rather than silently downgrading.
+	TLSFingerprint string `json:"tls_fingerprint,omitempty"`
+	// HandshakeSpacingMs is the minimum spacing between handshake attempts
+	// to the SAME server host inside an adaptive group (anti-salvo).
+	// Effective spacing is the value plus a uniform 0..value jitter.
+	// 0 = the 2000 ms default; values below 100 clamp to 100 ms, values
+	// above 60000 clamp to 60 s.
+	HandshakeSpacingMs uint32 `json:"handshake_spacing_ms,omitempty"`
 	// DPI gate axes (rtc transport only — the Rust client gates the rtc
 	// pump; wss stays ungated). DPIGateEnabled turns on the embedded
 	// ClientSelfGate (100% verdict parity against the Rust-exported
@@ -220,6 +234,11 @@ type HydraOutboundOptions struct {
 	TLSMinVersion       string   `json:"tls_min_version,omitempty"`
 	TLSMaxVersion       string   `json:"tls_max_version,omitempty"`
 	TLSALPN             []string `json:"tls_alpn,omitempty"`
+	// TLSFingerprint / HandshakeSpacingMs: same semantics as on the
+	// candidate (see HydraAdaptiveCandidateOptions). Empty / zero = the
+	// candidate's own value wins; on a candidate they are group defaults.
+	TLSFingerprint     string `json:"tls_fingerprint,omitempty"`
+	HandshakeSpacingMs uint32 `json:"handshake_spacing_ms,omitempty"`
 	// DPI gate axes (rtc only), same contract as on the candidate:
 	// enabled=false stays ungated and inherits the candidate's own axis;
 	// the threshold rides verbatim when the gate is on (0 = deliberate

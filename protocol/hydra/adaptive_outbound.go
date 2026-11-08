@@ -143,6 +143,11 @@ func newAdaptiveOutboundWithDependencies(ctx context.Context, router adapter.Rou
 			return nil, err
 		}
 	}
+	// Anti-salvo gate: every child handshake to the SAME host is spaced by
+	// the candidate's handshake_spacing_ms axis (jittered). One gate per
+	// adaptive outbound, so coordinator epochs and prewarms queue behind
+	// each other instead of bursting (solo outbounds are untouched).
+	spacingGate := newSNIGate()
 	candidates := make([]adaptive.Candidate, 0, len(a.Candidates))
 	built := make(map[string]*Outbound)
 	endpoints := make(map[string]bool)
@@ -154,7 +159,7 @@ func newAdaptiveOutboundWithDependencies(ctx context.Context, router adapter.Rou
 		if built[v.ID] != nil || endpoints[resolved.identity] {
 			return nil, fmt.Errorf("hydra: invalid candidate %q", v.ID)
 		}
-		child, e := buildResolvedCandidate(ctx, logger, tag, deps, factory, v, resolved)
+		child, e := buildResolvedCandidate(ctx, logger, tag, deps, factory, v, resolved, spacingGate)
 		if e != nil {
 			return nil, e
 		}
@@ -305,7 +310,7 @@ func newAdaptiveOutboundWithDependencies(ctx context.Context, router adapter.Rou
 				child := built[v.ID]
 				childrenMu.Unlock()
 				if child == nil {
-					builtChild, berr := buildResolvedCandidate(ctx, logger, tag, deps, factory, v, resolved)
+					builtChild, berr := buildResolvedCandidate(ctx, logger, tag, deps, factory, v, resolved, spacingGate)
 					if berr != nil {
 						return fmt.Errorf("hydra: catalogue swap %q: %w", tag, berr)
 					}
@@ -445,11 +450,11 @@ func resolveAdaptiveCandidate(options option.HydraOutboundOptions, logger log.Co
 // candidate (resolveAdaptiveCandidate). Split from resolution so callers
 // reject duplicate ids/identities BEFORE any dialer is built — a duplicate
 // must not consume a dialer from the factory.
-func buildResolvedCandidate(ctx context.Context, logger log.ContextLogger, tag string, deps adaptiveOutboundDependencies, factory func(context.Context, option.HydraAdaptiveCandidateOptions) (N.Dialer, error), v option.HydraAdaptiveCandidateOptions, resolved resolvedCandidate) (*Outbound, error) {
+func buildResolvedCandidate(ctx context.Context, logger log.ContextLogger, tag string, deps adaptiveOutboundDependencies, factory func(context.Context, option.HydraAdaptiveCandidateOptions) (N.Dialer, error), v option.HydraAdaptiveCandidateOptions, resolved resolvedCandidate, spacingGate *sniGate) (*Outbound, error) {
 	// TLS surface axes (tls_fragment / versions / alpn) are applied onto
 	// a copy of the candidate TLS options; the resolved axis values live
 	// on the child's own passthrough fields (single source of truth).
-	tlsOptions := applyTLSAxes(v.TLS, resolved.tuned.TLSFragment, resolved.tuned.TLSMinVersion, resolved.tuned.TLSMaxVersion, resolved.tuned.TLSALPN)
+	tlsOptions := applyTLSAxes(v.TLS, resolved.tuned.TLSFragment, resolved.tuned.TLSMinVersion, resolved.tuned.TLSMaxVersion, resolved.tuned.TLSALPN, resolved.tuned.TLSFingerprint)
 	base, e := factory(ctx, v)
 	if e != nil {
 		return nil, e
@@ -458,11 +463,22 @@ func buildResolvedCandidate(ctx context.Context, logger log.ContextLogger, tag s
 		return nil, fmt.Errorf("hydra: nil candidate dialer")
 	}
 	t := resolved.tuned
-	child, e := newStaticOutbound(ctx, logger, tag, option.HydraOutboundOptions{ServerOptions: v.ServerOptions, DialerOptions: v.DialerOptions, Pubkey: resolved.pubkey, Path: v.Path, TLS: tlsOptions, Transport: v.Transport, NegotiateMaxFrame: resolved.maxFrame, FragFirstMin: t.FragFirstMin, FragFirstMax: t.FragFirstMax, FragRestMin: t.FragRestMin, FragRestMax: t.FragRestMax, FragSplitDelayMs: t.FragSplitDelayMs, Disorder: t.Disorder, DisorderDelayMs: t.DisorderDelayMs, PadBuckets: t.PadBuckets, MaxPad: t.MaxPad, BigPadMax: t.BigPadMax, RTCChunk: t.RTCChunk, RTCWindow: t.RTCWindow, RTORtoMinMs: t.RTORtoMinMs, RTORtoMaxMs: t.RTORtoMaxMs, RTCBufferCap: t.RTCBufferCap, RTCKeepaliveEveryMs: t.RTCKeepaliveEveryMs, TLSFragment: t.TLSFragment, TLSMinVersion: t.TLSMinVersion, TLSMaxVersion: t.TLSMaxVersion, TLSALPN: t.TLSALPN, DPIGateEnabled: v.DPIGateEnabled, DPIGateThreshold: v.DPIGateThreshold}, base)
+	child, e := newStaticOutbound(ctx, logger, tag, option.HydraOutboundOptions{ServerOptions: v.ServerOptions, DialerOptions: v.DialerOptions, Pubkey: resolved.pubkey, Path: v.Path, TLS: tlsOptions, Transport: v.Transport, NegotiateMaxFrame: resolved.maxFrame, FragFirstMin: t.FragFirstMin, FragFirstMax: t.FragFirstMax, FragRestMin: t.FragRestMin, FragRestMax: t.FragRestMax, FragSplitDelayMs: t.FragSplitDelayMs, Disorder: t.Disorder, DisorderDelayMs: t.DisorderDelayMs, PadBuckets: t.PadBuckets, MaxPad: t.MaxPad, BigPadMax: t.BigPadMax, RTCChunk: t.RTCChunk, RTCWindow: t.RTCWindow, RTORtoMinMs: t.RTORtoMinMs, RTORtoMaxMs: t.RTORtoMaxMs, RTCBufferCap: t.RTCBufferCap, RTCKeepaliveEveryMs: t.RTCKeepaliveEveryMs, TLSFragment: t.TLSFragment, TLSMinVersion: t.TLSMinVersion, TLSMaxVersion: t.TLSMaxVersion, TLSALPN: t.TLSALPN, TLSFingerprint: t.TLSFingerprint, HandshakeSpacingMs: t.HandshakeSpacingMs, DPIGateEnabled: v.DPIGateEnabled, DPIGateThreshold: v.DPIGateThreshold}, base)
 	if e != nil {
 		return nil, e
 	}
-	return child.(*Outbound), nil
+	out := child.(*Outbound)
+	// Anti-salvo: gate the child's transport dialer (wss TCP dials AND rtc
+	// packet sockets) behind the shared per-host spacing gate so coordinator
+	// epochs and prewarms never burst handshakes at one host. Zero spacing
+	// (the option-level clamp never produces it, but tests pass nil gates)
+	// keeps the dialer untouched.
+	if spacingGate != nil {
+		host := strings.ToLower(strings.TrimSuffix(v.Server, "."))
+		out.dialer = sniSpacingDialer{Dialer: out.dialer, gate: spacingGate, host: host,
+			spacing: effectiveSpacing(host, t.HandshakeSpacingMs)}
+	}
+	return out, nil
 }
 
 func (o *Outbound) adaptiveSnapshot() adaptive.Snapshot {
